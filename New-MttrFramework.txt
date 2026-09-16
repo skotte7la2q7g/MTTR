@@ -9,21 +9,24 @@
      1. Framework & MTTR     The explanation. What the framework is, the three failure
                              scenarios, the replication mechanisms, how every restore
                              time was arrived at, and the assumptions you own.
-     2. Application Overview Pick an application and see its mapping drawn as a radial
-                             diagram - the application at the centre, its databases
-                             around it, grouped by environment and colour-coded - then
-                             the same thing as tables underneath. Click any node to
-                             pivot the diagram onto that SQL instance.
+     2. Application Overview The application at the top of a relationship map, then one
+                             card per environment, then the SQL instances inside it, then
+                             the databases on each instance. Click an instance name to
+                             jump to its full recovery scope.
      3. SQL Instance MTTR    Pick a SQL instance and see every database on it and how
                              long the whole instance takes to bring back.
      4. Executive Deck       Work in progress. One screen that says what this is.
+
+ COUNTS, NOT MARKERS
+   Where a set of databases is summarised it is stated as a number and an environment
+   spread - "6 databases, PROD 4 / UAT 1 / DEV 1" - never as a row of markers you would
+   have to count yourself.
 
  TWO RULES THE WHOLE REPORT FOLLOWS
    1. Anything not known prints as NULL. Never as zero, never as an average, and never
       dressed up in a phrase. NULL is a fact: it says go and collect this.
    2. Recovery is counted one database at a time, one instance at a time. That is the
-      longest it can take, and it is the only figure worth planning against. Restoring
-      in parallel is offered as a way to reduce it, not assumed as the baseline.
+      longest it can take, and it is the only figure worth planning against.
 
  HOW A RESTORE TIME IS ARRIVED AT
    Every database resolves down a three-rung ladder and the rung is printed next to the
@@ -618,6 +621,7 @@ function Add-InventoryRows {
         $sheetCompat = Get-FieldValue $row @('compatibility level', 'compatibility')
         $sheetMechanism = Get-FieldValue $row @('ha/dr method', 'hadr method', 'dr method', 'data replication method', 'replication method')
         $sheetRestore = Get-FieldValue $row @('last restore duration (minutes)', 'restore duration (minutes)', 'measured restore minutes')
+        $sheetVersion = Get-FieldValue $row @('sql version', 'sql server version', 'version')
 
         $inventory.Add([pscustomobject]@{
             Application     = $(if ($application) { $application } else { 'Unattributed' })
@@ -629,6 +633,7 @@ function Add-InventoryRows {
             SheetCompat     = $sheetCompat
             SheetMechanism  = $sheetMechanism
             SheetRestore    = $sheetRestore
+            SheetVersion    = $sheetVersion
         })
     }
 }
@@ -639,6 +644,15 @@ $inventory = @($inventory | Sort-Object Application, Instance, Database, Environ
 if ($inventory.Count -eq 0) { throw 'No inventory records were found in the source workbook.' }
 
 $instanceNames = @($inventory.Instance | Where-Object { $_ } | Sort-Object -Unique)
+
+# A version typed into the workbook is better than no version at all. Anything collected
+# from the instance itself overrides it.
+$sheetVersionByInstance = @{}
+foreach ($row in $inventory) {
+    if ($row.Instance -and $row.SheetVersion -and -not $sheetVersionByInstance.ContainsKey($row.Instance)) {
+        $sheetVersionByInstance[$row.Instance] = $row.SheetVersion
+    }
+}
 
 # =========================================================================================
 # REGION  Connectivity and evidence
@@ -748,14 +762,20 @@ $data = @($inventory | ForEach-Object {
 $instanceMeta = @($instanceNames | ForEach-Object {
     $name = $_
     $evidence = $(if ($evidenceByInstance.ContainsKey($name)) { $evidenceByInstance[$name] } else { $null })
+    $version = $(if ($evidence -and $evidence.version) { $evidence.version }
+                 elseif ($sheetVersionByInstance.ContainsKey($name)) { $sheetVersionByInstance[$name] }
+                 else { '' })
     [ordered]@{
-        instance     = $name
-        status       = $(if ($evidence) { $evidence.status } else { 'Not collected' })
-        message      = $(if ($evidence) { $evidence.message } else { '' })
-        version      = $(if ($evidence) { $evidence.version } else { '' })
-        productLevel = $(if ($evidence) { $evidence.productLevel } else { '' })
-        edition      = $(if ($evidence) { $evidence.edition } else { '' })
-        connectivity = $statusByInstance[$name]
+        instance      = $name
+        status        = $(if ($evidence) { $evidence.status } else { 'Not collected' })
+        message       = $(if ($evidence) { $evidence.message } else { '' })
+        version       = $version
+        versionSource = $(if ($evidence -and $evidence.version) { 'measured' }
+                          elseif ($sheetVersionByInstance.ContainsKey($name)) { 'workbook' }
+                          else { 'none' })
+        productLevel  = $(if ($evidence) { $evidence.productLevel } else { '' })
+        edition       = $(if ($evidence) { $evidence.edition } else { '' })
+        connectivity  = $statusByInstance[$name]
     }
 })
 
@@ -843,7 +863,7 @@ p.lead{margin:0 0 16px;color:var(--ink2);line-height:1.6;max-width:1080px}
 /* ---- cards / KPIs ---- */
 .kpi{background:#fff;border:1px solid var(--line);border-top:4px solid var(--accent-c,var(--accent));border-radius:9px;padding:13px 15px}
 .kpi b{display:block;color:var(--brand);font-size:26px;line-height:1.05}
-.kpi .sub{display:block;margin-top:4px;color:var(--ink3);font-size:10px}
+.kpi .sub{display:block;margin-top:5px;color:var(--ink3);font-size:10px}
 .kpi span.lbl{display:block;margin-top:6px;color:var(--ink2);font-size:10px;font-weight:650;text-transform:uppercase;letter-spacing:.4px}
 .card{border:1px solid var(--line);border-top:4px solid var(--accent-c,var(--accent));border-radius:9px;padding:14px;background:#fff}
 .card b.h{display:block;color:var(--brand);font-size:12.5px;margin-bottom:7px}
@@ -852,26 +872,10 @@ p.lead{margin:0 0 16px;color:var(--ink2);line-height:1.6;max-width:1080px}
 .callout{margin-top:14px;padding:13px 15px;border:1px solid var(--line);border-left:5px solid var(--accent);border-radius:8px;background:var(--accent-soft);color:#12402C;font-size:11.5px;line-height:1.6}
 .callout.warn{border-left-color:var(--med);background:var(--med-bg);color:#5C4700}
 
-/* ---- circles: one per database, coloured by environment ---- */
-.dot{display:inline-block;width:11px;height:11px;border-radius:50%;background:var(--ink3);box-shadow:0 0 0 1px rgba(255,255,255,.9),0 0 0 2px rgba(31,35,51,.10)}
-.dot.sm{width:8px;height:8px;box-shadow:0 0 0 1px rgba(255,255,255,.9),0 0 0 1.5px rgba(31,35,51,.10)}
-.dots{display:inline-flex;flex-wrap:wrap;gap:5px;align-items:center;vertical-align:middle}
-.dots.sm{gap:4px}
-
-/* ---- the mapping diagram ---- */
-.viz-wrap{position:relative;overflow:hidden}
-.viz{width:100%;height:620px;display:block;background:radial-gradient(circle at 50% 46%,#ffffff 0%,#F8FAFC 55%,#EEF2F7 100%)}
-.crumbs{display:flex;gap:6px;align-items:center;flex-wrap:wrap;padding:10px 14px;border-bottom:1px solid var(--line2);font-size:12px}
-.crumb{color:var(--accent-dark);cursor:pointer;font-weight:650;background:none;border:0;font:inherit;padding:0}
-.crumb:hover{text-decoration:underline}
-.crumb.cur{color:var(--ink);cursor:default;font-weight:700;text-decoration:none}
-.viz-legend{display:flex;gap:14px;flex-wrap:wrap;align-items:center;padding:9px 14px;border-top:1px solid var(--line2);font-size:10.5px;color:var(--ink2)}
-.viz-legend span{display:inline-flex;align-items:center;gap:6px}
-.viz-legend i.sw{width:11px;height:11px;border-radius:3px;display:inline-block}
-.nodeG{cursor:pointer}
-.nodeG:hover .nbox{stroke-width:2.8}
-.nbox{transition:stroke-width .12s}
-svg text{font-family:"Segoe UI",Arial,sans-serif}
+/* ---- environment spread: a count per environment, never a row of markers ---- */
+.spread{display:inline-flex;flex-wrap:wrap;gap:10px;align-items:center}
+.spread .ec{display:inline-flex;align-items:center;gap:5px;font-size:9.5px;font-weight:700;letter-spacing:.2px;white-space:nowrap}
+.spread .ec:before{content:"";width:9px;height:9px;border-radius:2px;background:var(--env-c,var(--ink3))}
 
 /* ---- badges ---- */
 .badge{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border-radius:999px;font-size:9.5px;font-weight:700;white-space:nowrap;border:1px solid transparent}
@@ -904,18 +908,58 @@ svg text{font-family:"Segoe UI",Arial,sans-serif}
 .tbl-wrap{overflow:auto;border:1px solid var(--line);border-radius:9px;background:#fff}
 .mono{font-variant-numeric:tabular-nums}
 
+/* =========================================================================
+   APPLICATION RELATIONSHIP MAP
+   The application sits at the top, one card per environment below it, the SQL
+   instances inside each card, and the databases under each instance. The
+   instance name is the thing being emphasised - it is what gets rebuilt.
+   ========================================================================= */
+.topo{padding:20px 18px 18px}
+.flow-root{display:flex;justify-content:center}
+.root-circle{width:158px;height:158px;border-radius:50%;background:linear-gradient(135deg,var(--brand-dark),var(--brand));color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:16px;border:5px solid var(--brand-soft);box-shadow:0 10px 26px rgba(31,35,51,.22)}
+.root-circle b{font-size:13.5px;font-weight:700;line-height:1.25;overflow-wrap:anywhere}
+.root-circle span{display:block;font-size:9.5px;color:#C9CEDA;margin-top:6px;line-height:1.4}
+.pointer-line{width:2px;height:32px;background:var(--line);margin:0 auto;position:relative}
+.pointer-line:after{content:"";position:absolute;bottom:-1px;left:-4px;border-left:5px solid transparent;border-right:5px solid transparent;border-top:8px solid var(--line)}
+.env-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:13px;margin-top:12px}
+.env-card{border:1px solid var(--line);border-top:5px solid var(--env-c,var(--ink3));border-radius:10px;background:#fff;padding:15px;box-shadow:0 2px 10px rgba(31,35,51,.05)}
+.env-card .eh{display:flex;align-items:center;gap:13px}
+.env-circle{width:64px;height:64px;flex:0 0 64px;border-radius:50%;background:var(--env-c,var(--ink3));color:#fff;display:flex;align-items:center;justify-content:center;text-align:center;font-size:9.5px;font-weight:800;letter-spacing:.3px;line-height:1.15;padding:5px;word-break:break-word;box-shadow:0 0 0 3px #fff,0 0 0 5px var(--env-c,var(--ink3))}
+.env-sum b{display:block;font-size:13.5px;color:var(--brand)}
+.env-sum span{display:block;font-size:10.5px;color:var(--ink3);margin-top:3px;line-height:1.45}
+.inst-stack{margin:14px 0 0 32px;padding-left:22px;border-left:2px solid var(--line)}
+.inst-node{position:relative;padding:10px 0}
+.inst-node:before{content:"";position:absolute;left:-22px;top:17px;width:22px;height:2px;background:var(--line)}
+.inst-node:after{content:"";position:absolute;left:-28px;top:12px;width:12px;height:12px;border-radius:50%;background:#fff;border:2.5px solid var(--env-c,var(--ink3))}
+.inst-top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}
+.inst-link{font-size:12.5px;font-weight:700;color:var(--brand);cursor:pointer;background:none;border:0;font-family:inherit;padding:0;text-decoration:underline dotted;text-underline-offset:3px;overflow-wrap:anywhere;text-align:left}
+.inst-link:hover{color:var(--accent-dark)}
+.inst-meta{font-size:9.5px;color:var(--ink3);margin-top:3px;line-height:1.45}
+.inst-fig{font-size:9.5px;color:var(--ink3);white-space:nowrap;text-align:right}
+.inst-fig b{color:var(--brand);font-size:12.5px;font-variant-numeric:tabular-nums}
+.dbchips{display:flex;flex-wrap:wrap;gap:6px;margin-top:9px}
+.dbchip{display:inline-flex;align-items:baseline;gap:7px;border:1px solid var(--line);border-left:4px solid var(--basis-c,var(--ink3));border-radius:6px;background:#FBFCFE;padding:5px 9px}
+.dbchip b{font-size:10.5px;font-weight:650;color:var(--ink)}
+.dbchip span{font-size:9px;color:var(--ink3);font-variant-numeric:tabular-nums;white-space:nowrap}
+.map-legend{display:flex;gap:14px;flex-wrap:wrap;align-items:center;padding:10px 18px;border-top:1px solid var(--line2);font-size:10.5px;color:var(--ink2)}
+.map-legend span{display:inline-flex;align-items:center;gap:6px}
+.map-legend i.sw{width:11px;height:11px;border-radius:3px;display:inline-block}
+.map-legend i.rd{width:11px;height:11px;border-radius:50%;display:inline-block}
+
 /* ---- application panel ---- */
-.app-layout{display:grid;grid-template-columns:290px minmax(0,1fr);gap:14px;align-items:start}
+.app-layout{display:grid;grid-template-columns:300px minmax(0,1fr);gap:14px;align-items:start}
 .app-side{position:sticky;top:0}
 .search{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:7px;font:inherit;outline:none}
 .search:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
 .app-list{max-height:calc(100vh - 260px);overflow:auto;padding:10px;display:grid;gap:6px}
-.app-btn{width:100%;text-align:left;border:1px solid var(--line);border-left:4px solid var(--accent);background:#fff;border-radius:7px;padding:9px 11px;cursor:pointer;font:inherit;transition:.12s}
+.app-btn{width:100%;text-align:left;border:1px solid var(--line);border-left:4px solid var(--accent);background:#fff;border-radius:7px;padding:10px 11px;cursor:pointer;font:inherit;transition:.12s}
 .app-btn:hover{background:var(--brand-soft)}
 .app-btn.active{background:var(--brand);color:#fff;border-color:var(--brand);border-left-color:var(--accent)}
 .app-btn b{display:block;font-size:11.5px;font-weight:650}
-.app-btn span.s{display:block;font-size:9.5px;color:var(--ink3);margin-top:1px}
+.app-btn span.s{display:block;font-size:9.5px;color:var(--ink3);margin-top:2px}
 .app-btn.active span.s{color:#C9CEDA}
+.app-btn .spread{margin-top:5px;color:var(--ink2)}
+.app-btn.active .spread{color:#E4E8F0}
 .env-block{border:1px solid var(--line);border-radius:9px;margin-bottom:12px;overflow:hidden;background:#fff}
 .env-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 14px;background:var(--brand-soft);border-bottom:1px solid var(--line);flex-wrap:wrap}
 .env-head .l{display:flex;align-items:center;gap:10px}
@@ -947,13 +991,13 @@ details.inst[open] summary:before{transform:rotate(90deg)}
 .saved{color:var(--accent-dark);font-size:10.5px;font-weight:700}
 
 /* ---- server panel ---- */
-.srv-layout{display:grid;grid-template-columns:310px minmax(0,1fr);gap:14px;align-items:start}
+.srv-layout{display:grid;grid-template-columns:320px minmax(0,1fr);gap:14px;align-items:start}
 .srv-list{max-height:calc(100vh - 260px);overflow:auto;padding:10px;display:grid;gap:6px}
-.srv-btn{width:100%;text-align:left;border:1px solid var(--line);border-left:4px solid var(--brand);background:#fff;border-radius:7px;padding:9px 11px;cursor:pointer;font:inherit}
+.srv-btn{width:100%;text-align:left;border:1px solid var(--line);border-left:4px solid var(--brand);background:#fff;border-radius:7px;padding:10px 11px;cursor:pointer;font:inherit}
 .srv-btn:hover{background:var(--brand-soft)}
 .srv-btn.active{background:var(--brand);color:#fff}
 .srv-btn b{display:block;font-size:11px}
-.srv-btn span.s{display:block;font-size:9px;color:var(--ink3);margin-top:2px}
+.srv-btn span.s{display:block;font-size:9.5px;color:var(--ink3);margin-top:3px;line-height:1.45}
 .srv-btn.active span.s{color:#C9CEDA}
 .meta{display:grid;grid-template-columns:repeat(4,1fr);gap:9px;margin:12px 0}
 .meta-box{border:1px solid var(--line);background:var(--brand-soft);border-radius:7px;padding:9px 11px}
@@ -978,9 +1022,9 @@ details.inst[open] summary:before{transform:rotate(90deg)}
   .grid4,.assume,.meta{grid-template-columns:repeat(2,1fr)}
   .grid3{grid-template-columns:1fr}
   .app-layout,.srv-layout{grid-template-columns:1fr}
+  .env-grid{grid-template-columns:1fr}
   .top-stats{display:none}
   body{overflow:auto}.shell{height:auto;min-height:100vh}
-  .viz{height:520px}
 }
 @media print{
   body{overflow:visible}.nav-tabs,.app-side,.srv-list{display:none}
@@ -1049,7 +1093,7 @@ details.inst[open] summary:before{transform:rotate(90deg)}
     </div>
 
     <h3 class="sec">How each restore time on this page was arrived at</h3>
-    <p class="lead">Every database resolves down this ladder and stops at the first rung it can stand on. The rung is shown next to the figure, everywhere the figure appears &mdash; including as a coloured marker on every node of the mapping diagram.</p>
+    <p class="lead">Every database resolves down this ladder and stops at the first rung it can stand on. The rung is shown next to the figure, everywhere the figure appears &mdash; including as the coloured edge of every database on the relationship map.</p>
     <div class="tbl-wrap">
       <table class="table">
         <thead><tr><th>Rung</th><th>Basis</th><th>Where it comes from</th></tr></thead>
@@ -1113,19 +1157,22 @@ details.inst[open] summary:before{transform:rotate(90deg)}
         <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap">
           <div>
             <h2 class="sec" id="appTitle">Select an application</h2>
-            <p class="note" id="appSubtitle">Choose an application to see its mapping and its recovery time.</p>
+            <p class="note" id="appSubtitle">Choose an application to see its relationship map and its recovery time.</p>
           </div>
           <select id="envFilter" class="search" style="width:auto;min-width:190px"><option value="ALL">All environments</option></select>
         </div>
         <div class="grid4" id="appKpis" style="margin-top:14px"></div>
         <div id="appDetails" class="callout hidden" style="max-height:120px;overflow:auto"></div>
-        <div id="appReduce"></div>
+        <p class="note" id="appNote" style="margin-top:12px"></p>
       </div>
 
-      <div class="panel viz-wrap" style="margin-bottom:12px">
-        <div class="crumbs" id="vizCrumbs"></div>
-        <svg class="viz" id="appViz" viewBox="0 0 1000 620" preserveAspectRatio="xMidYMid meet"></svg>
-        <div class="viz-legend" id="vizLegend"></div>
+      <div class="panel" style="margin-bottom:12px">
+        <div style="padding:15px 18px 0">
+          <b style="color:var(--brand);font-size:13px">Application relationship map</b>
+          <p class="note" style="margin:5px 0 0">Application, then environment, then SQL instance, then the databases on it. Click a SQL instance name to open its complete recovery scope.</p>
+        </div>
+        <div class="topo" id="appTopo"></div>
+        <div class="map-legend" id="appTopoLegend"></div>
       </div>
 
       <div id="appEnvironments"></div>
@@ -1189,9 +1236,44 @@ const COMPAT = {60:'SQL Server 6.0',65:'SQL Server 6.5',70:'SQL Server 7.0',80:'
   140:'SQL Server 2017',150:'SQL Server 2019',160:'SQL Server 2022',170:'SQL Server 2025'};
 const compatLabel = v => { const n = num(v); return (n && COMPAT[n]) ? `${n} (${COMPAT[n]})` : (n ? String(n) : null); };
 
+/* A product version like 10.50.6000.34 means nothing to the person reading the report.
+   Show the release name, and keep the build number for whoever needs it. */
+const SQL_MAJOR = {'8':'SQL Server 2000','9':'SQL Server 2005','10.0':'SQL Server 2008','10.50':'SQL Server 2008 R2',
+  '11':'SQL Server 2012','12':'SQL Server 2014','13':'SQL Server 2016','14':'SQL Server 2017','15':'SQL Server 2019',
+  '16':'SQL Server 2022','17':'SQL Server 2025'};
+function sqlRelease(version) {
+  if (!version) return null;
+  const clean = String(version).trim();
+  const named = clean.match(/(?:SQL\s*Server\s*)?((?:20)?(?:00|05|08|12|14|16|17|19|22|25))(\s*R2)?/i);
+  const parts = clean.split('.');
+  if (parts.length >= 2) {
+    const two = `${parts[0]}.${parts[1]}`;
+    if (SQL_MAJOR[two]) return SQL_MAJOR[two];
+    if (SQL_MAJOR[parts[0]]) return SQL_MAJOR[parts[0]];
+  }
+  /* A workbook can hold "2016" or "SQL Server 2016" rather than a build number. */
+  if (named) {
+    const year = named[1].length === 2 ? '20' + named[1] : named[1];
+    return `SQL Server ${year}${named[2] ? ' R2' : ''}`;
+  }
+  return null;
+}
+/* "SQL Server 2019" where the release is known, otherwise the raw string, otherwise NULL. */
+function versionLabel(meta) {
+  if (!meta || !meta.version) return null;
+  return sqlRelease(meta.version) || String(meta.version);
+}
+function versionFull(meta) {
+  if (!meta || !meta.version) return null;
+  const release = sqlRelease(meta.version);
+  const build = String(meta.version);
+  const level = meta.productLevel ? ` ${meta.productLevel}` : '';
+  return (release && release !== build) ? `${release} (${build}${level})` : `${build}${level}`;
+}
+
 /* Environment colour is how a name carries its context. Lists are ordered by name; the
    colour is what tells you whether the row is production. The same hex values drive the
-   CSS tags and the SVG diagram, so a PROD database is the same red in both. */
+   CSS tags, the environment cards and the spread counts. */
 const ENV_ORDER = ['PROD','PRD','PRODUCTION','DR','UAT','SIT','QA','TEST','DEV','SANDBOX','NONPROD','UNKNOWN'];
 const ENV_HEX = {PROD:'#C6093B',PRD:'#C6093B',PRODUCTION:'#C6093B',DR:'#6B4BA3',UAT:'#D9660A',
   SIT:'#0F6FA8',QA:'#0F6FA8',TEST:'#0F6FA8',DEV:'#00875D',SANDBOX:'#00695C',NONPROD:'#7B8397',UNKNOWN:'#7B8397'};
@@ -1201,9 +1283,19 @@ const envHex = e => ENV_HEX[String(e).toUpperCase()] || '#7B8397';
 const envTag = e => `<span class="env ${envClass(e)}">${esc(e)}</span>`;
 const isProd = e => /^(PROD|PRD|PRODUCTION)$/i.test(String(e));
 
-/* Evidence basis colours, used on the badge circle of every diagram node. */
+/* How a set of databases is spread across environments, as counts. "PROD 4 UAT 1 DEV 1"
+   is one glance; a row of markers is arithmetic the reader should not have to do. */
+function envCounts(dbs) {
+  const m = new Map();
+  dbs.forEach(d => m.set(d.environment, (m.get(d.environment) || 0) + 1));
+  return [...m.entries()].sort((a, b) => envRank(a[0]) - envRank(b[0]));
+}
+const spreadHtml = dbs => `<span class="spread">` + envCounts(dbs)
+  .map(([e, n]) => `<span class="ec" style="--env-c:${envHex(e)}">${esc(e)} ${n}</span>`).join('') + `</span>`;
+const spreadText = dbs => envCounts(dbs).map(([e, n]) => `${e} ${n}`).join(' / ');
+
+/* Evidence basis colours, used on the edge of every database chip. */
 const BASIS_HEX = { measured:'#00875D', derived:'#0067B9', none:'#7B8397' };
-const BASIS_GLYPH = { measured:'M', derived:'D', none:'?' };
 
 /* Hours are the unit of the conversation. Minutes are the unit of the arithmetic. */
 function hoursText(minutes) {
@@ -1376,277 +1468,16 @@ function applicationMttr(app, environmentFilter) {
 
   const totals = legs.map(l => l.total).filter(t => t !== null);
   const complete = totals.length === legs.length && legs.length > 0 ? sum(totals) : null;
-  const ifParallel = totals.length === legs.length && legs.length > 0 ? Math.max(...totals) : null;
 
   const mix = { measured: 0, derived: 0, none: 0 };
   legs.forEach(l => Object.keys(mix).forEach(k => mix[k] += l.work.mix[k]));
 
-  return { dbs, legs, complete, ifParallel, mix,
+  return { dbs, legs, complete, mix,
            collateral: uniq(legs.flatMap(l => l.instance.appList)).filter(a => a !== app.name).sort(byName) };
 }
 
 const kpiHtml = ([label, value, sub, colour]) =>
   `<div class="kpi" style="--accent-c:${colour}"><b>${value}</b><span class="lbl">${esc(label)}</span><span class="sub">${sub}</span></div>`;
-
-const dotFor = (d, small) =>
-  `<span class="dot${small ? ' sm' : ''} ${envClass(d.environment)}" title="${esc(d.database)} (${esc(d.environment)}) - restore ${esc(hoursText(restoreOf(d).minutes))}"></span>`;
-
-/* =========================================================================================
-   THE MAPPING DIAGRAM
-
-   Ported from the estate mapping explorer, because that layout answers the question the
-   tables cannot: what is the shape of this application. The selected entity sits at the
-   centre; everything connected to it is arranged around it, split into sectors - by
-   environment when centred on an application, by application when centred on an instance -
-   so like sits with like. Every node is one database, its border is its environment colour,
-   and the small circle on it is the evidence rung behind its restore time.
-========================================================================================= */
-
-/* Two concentric rings, outermost first. A sector only spills inward when its nodes
-   genuinely will not fit on the ring above, so simple cases stay on one clean circle.
-   The ring spacing must exceed the node width: near three and nine o'clock the radial
-   direction is horizontal, so two nodes on adjacent rings at a similar angle are separated
-   only by the ring gap. */
-const RADII = [248, 142];
-const SECTOR_GAP = 0.20;   /* radians of clear space between sectors */
-const SECTOR_PAD = 0.10;   /* keep nodes off the sector edges */
-
-function layoutRadial(groups, cx, cy, nodeW) {
-  const total = groups.reduce((a, g) => a + g.items.length, 0) || 1;
-  let angle = -Math.PI / 2 + SECTOR_GAP / 2;   /* start at twelve o'clock */
-  const out = [];
-
-  groups.forEach(g => {
-    const n = g.items.length;
-    const span = Math.max((Math.PI * 2) * (n / total) - SECTOR_GAP, 0.14);
-    const usable = span * (1 - 2 * SECTOR_PAD);
-
-    /* Capacity is computed per ring: the same node subtends a much larger angle on the
-       inner ring than on the outer one, so sizing every ring off the outer radius
-       guarantees the inner ring overlaps. */
-    const caps = RADII.map(r => Math.max(1, Math.floor(usable / ((nodeW + 16) / r)) + 1));
-
-    /* Fill from the outside in - the outer ring holds the most and reads best. */
-    const buckets = RADII.map(() => []);
-    let ringIndex = 0;
-    g.items.forEach(item => {
-      while (ringIndex < RADII.length - 1 && buckets[ringIndex].length >= caps[ringIndex]) ringIndex++;
-      buckets[ringIndex].push(item);
-    });
-
-    buckets.forEach((bucket, ri) => {
-      const r = RADII[ri];
-      const m = bucket.length;
-      if (!m) return;
-      bucket.forEach((item, i) => {
-        /* Stagger alternate rings by half a step so an inner node sits in the gap between
-           the two outside it rather than directly behind one of them. */
-        const offset = (ri % 2) ? (0.5 / Math.max(m, 1)) : 0;
-        const frac = m === 1 ? 0.5 : (SECTOR_PAD + (i / (m - 1)) * (1 - 2 * SECTOR_PAD) + offset);
-        const a = angle + span * Math.min(Math.max(frac, 0), 1);
-        out.push({ item, group: g, angle: a, x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r });
-      });
-    });
-
-    angle += span + SECTOR_GAP;
-  });
-  return out;
-}
-
-/* Beyond this a radial view is the wrong tool and the tables below are the right one, so
-   draw a representative subset and say plainly how many were left out. */
-function radialCapacity(groupCount, nodeW) {
-  const gapTotal = SECTOR_GAP * Math.max(groupCount, 1);
-  const usable = ((Math.PI * 2) - gapTotal) * 0.80;
-  return RADII.reduce((a, r) => a + Math.max(1, Math.floor(usable / ((nodeW + 16) / r)) + 1), 0);
-}
-
-function svgNode(x, y, w, h, label, sub, stroke, dash, type, id, badge, tip) {
-  const half = w / 2;
-  /* Truncate to what the box can actually hold - roughly 6.1px per character at 11.5px
-     and 4.9px at 9.5px - so a narrow node clips its label instead of overflowing it. */
-  const maxMain = Math.max(6, Math.floor((w - 16) / 6.1));
-  const maxSub  = Math.max(6, Math.floor((w - 12) / 4.9));
-  const t = label.length > maxMain ? label.slice(0, maxMain - 1) + '…' : label;
-  const s = sub && sub.length > maxSub ? sub.slice(0, maxSub - 1) + '…' : (sub || '');
-  return `<g class="nodeG" data-type="${esc(type)}" data-id="${esc(id)}">`
-    + `<title>${esc(tip)}</title>`
-    + `<rect class="nbox" x="${x - half}" y="${y - h / 2}" width="${w}" height="${h}" rx="7" `
-    + `fill="#ffffff" stroke="${stroke}" stroke-width="1.7"${dash ? ' stroke-dasharray="4 3"' : ''}></rect>`
-    + `<text x="${x}" y="${y - (s ? 4 : -4)}" text-anchor="middle" font-size="11.5" font-weight="640" fill="#1F2333">${esc(t)}</text>`
-    + (s ? `<text x="${x}" y="${y + 9}" text-anchor="middle" font-size="9.5" fill="#5C6B80">${esc(s)}</text>` : '')
-    + `<circle cx="${x + half - 7}" cy="${y - h / 2 + 7}" r="6.5" fill="${badge.c}"></circle>`
-    + `<text x="${x + half - 7}" y="${y - h / 2 + 10.5}" text-anchor="middle" font-size="8.5" font-weight="700" fill="#fff">${esc(badge.t)}</text>`
-    + `</g>`;
-}
-
-/* Diagram state. The trail is the breadcrumb: centre on an application, click a database to
-   pivot onto the SQL instance it lives on, click again to come back out. */
-let vizState = { type: 'app', id: null, trail: [] };
-
-function vizModel(app, m) {
-  if (vizState.type === 'inst') {
-    const inst = instances.get(vizState.id);
-    if (!inst) return null;
-    const byApp = new Map();
-    inst.databases.forEach(d => d.apps.forEach(a => {
-      if (!byApp.has(a)) byApp.set(a, []);
-      byApp.get(a).push(d);
-    }));
-    const groups = [...byApp.keys()].sort(byName).map(a => ({
-      key: a, label: a, colour: '#34384B',
-      items: byApp.get(a).map(d => ({
-        db: d,
-        sub: `${gbText(d.sizeGb)} · ${hoursText(restoreOf(d).minutes)}`,
-        target: { type: 'app', id: a }
-      }))
-    }));
-    return {
-      centre: { label: inst.instance, sub: `${inst.environment} · ${inst.databases.length} databases`,
-                stroke: envHex(inst.environment) },
-      groups,
-      caption: `Every database on <b>${esc(inst.instance)}</b> ${envTag(inst.environment)}, grouped by the application that uses it. `
-             + `A dashed node is shared by more than one application, so it appears in each sector it belongs to.`
-    };
-  }
-
-  const byEnv = new Map();
-  m.dbs.forEach(d => { if (!byEnv.has(d.environment)) byEnv.set(d.environment, []); byEnv.get(d.environment).push(d); });
-  const groups = [...byEnv.entries()].sort((a, b) => envRank(a[0]) - envRank(b[0])).map(([env, dbs]) => ({
-    key: env, label: env, colour: envHex(env),
-    items: dbs.slice().sort((a, b) => byName(a.database, b.database)).map(d => ({
-      db: d,
-      sub: `${d.instance} · ${hoursText(restoreOf(d).minutes)}`,
-      target: { type: 'inst', id: d.instance }
-    }))
-  }));
-  return {
-    centre: { label: app.name, sub: `${m.dbs.length} databases · ${m.legs.length} instances`, stroke: '#34384B' },
-    groups,
-    caption: `<b>${esc(app.name)}</b> and every database it depends on, one sector per environment, production first. `
-           + `Click a database to pivot the diagram onto the SQL instance it lives on.`
-  };
-}
-
-function renderAppViz(app, m) {
-  const svg = document.getElementById('appViz');
-  const legend = document.getElementById('vizLegend');
-  const cx = 500, cy = 296;
-
-  const model = vizModel(app, m);
-  if (!model || !model.groups.length) {
-    svg.innerHTML = `<text x="${cx}" y="${cy}" text-anchor="middle" font-size="14" fill="#7B8397">Nothing to map for this filter.</text>`;
-    legend.innerHTML = '';
-    renderVizCrumbs();
-    return;
-  }
-
-  const groups = model.groups.map(g => ({ ...g, items: g.items.slice() }));
-  let totalNodes = sum(groups.map(g => g.items.length));
-  const nodeW = totalNodes > 20 ? 104 : (totalNodes > 10 ? 116 : 136);
-  const nodeH = totalNodes > 20 ? 28 : 34;
-
-  /* Trim proportionally so no sector disappears entirely, and record what was dropped. */
-  const cap = radialCapacity(groups.length, nodeW);
-  let omitted = 0;
-  if (totalNodes > cap) {
-    const keep = cap / totalNodes;
-    groups.forEach(g => {
-      const allow = Math.max(1, Math.floor(g.items.length * keep));
-      if (g.items.length > allow) { omitted += g.items.length - allow; g.items = g.items.slice(0, allow); }
-    });
-    totalNodes = sum(groups.map(g => g.items.length));
-  }
-
-  const pos = layoutRadial(groups, cx, cy, nodeW);
-  let out = '';
-
-  /* Pointers first, so the nodes paint over them. */
-  pos.forEach(p => {
-    const mx = cx + (p.x - cx) * 0.55, my = cy + (p.y - cy) * 0.55;
-    out += `<path d="M ${cx} ${cy} Q ${mx} ${my} ${p.x} ${p.y}" fill="none" stroke="${envHex(p.item.db.environment)}" stroke-width="1.3" opacity=".40"></path>`;
-  });
-
-  /* Sector labels just outside the outer ring. */
-  groups.forEach(g => {
-    const mine = pos.filter(p => p.group.key === g.key);
-    if (!mine.length) return;
-    const avg = sum(mine.map(p => p.angle)) / mine.length;
-    const lx = cx + Math.cos(avg) * 288, ly = cy + Math.sin(avg) * 288;
-    const label = g.label.length > 22 ? g.label.slice(0, 21) + '…' : g.label;
-    out += `<text x="${lx}" y="${ly}" text-anchor="middle" font-size="11" font-weight="700" fill="${g.colour}" opacity=".9">${esc(label)}</text>`;
-  });
-
-  pos.forEach(p => {
-    const d = p.item.db;
-    const r = restoreOf(d);
-    const tip = `${d.database} (${d.environment}) on ${d.instance}\n`
-      + `${gbText(d.sizeGb)} · restore ${hoursText(r.minutes)} · ${r.label}\n${r.detail}`;
-    out += svgNode(p.x, p.y, nodeW, nodeH, d.database, p.item.sub, envHex(d.environment), d.shared,
-                   p.item.target.type, p.item.target.id,
-                   { c: BASIS_HEX[r.basis], t: BASIS_GLYPH[r.basis] }, tip);
-  });
-
-  /* Centre last, so it sits on top of everything. */
-  const centreLabel = model.centre.label.length > 20 ? model.centre.label.slice(0, 19) + '…' : model.centre.label;
-  out += `<circle cx="${cx}" cy="${cy}" r="86" fill="#fff" stroke="${model.centre.stroke}" stroke-width="2.4" opacity=".98"></circle>`;
-  out += `<text x="${cx}" y="${cy - 6}" text-anchor="middle" font-size="13.5" font-weight="700" fill="#1F2333">${esc(centreLabel)}</text>`;
-  out += `<text x="${cx}" y="${cy + 12}" text-anchor="middle" font-size="10" fill="#5C6B80">${esc(model.centre.sub)}</text>`;
-
-  if (omitted > 0) {
-    out += `<text x="${cx}" y="602" text-anchor="middle" font-size="11.5" font-weight="600" fill="#C6093B">`
-         + `${omitted} further database${omitted === 1 ? '' : 's'} not drawn - the diagram is capped for legibility. `
-         + `The tables below list every one.</text>`;
-  }
-
-  svg.innerHTML = out;
-
-  const envsShown = uniq(pos.map(p => p.item.db.environment)).sort((a, b) => envRank(a) - envRank(b));
-  legend.innerHTML =
-    envsShown.map(e => `<span><i class="sw" style="background:${envHex(e)}"></i>${esc(e)}</span>`).join('')
-    + `<span style="margin-left:14px"><i class="sw" style="border-radius:50%;background:${BASIS_HEX.measured}"></i>M measured</span>`
-    + `<span><i class="sw" style="border-radius:50%;background:${BASIS_HEX.derived}"></i>D derived</span>`
-    + `<span><i class="sw" style="border-radius:50%;background:${BASIS_HEX.none}"></i>? NULL</span>`
-    + `<span style="margin-left:auto;color:var(--ink3)">One node is one database. Click to pivot.</span>`;
-
-  /* Crumbs are rebuilt first, because they carry the caption element the line below fills. */
-  renderVizCrumbs();
-  const caption = document.getElementById('vizCaption');
-  if (caption) caption.innerHTML = model.caption;
-}
-
-function renderVizCrumbs() {
-  const el = document.getElementById('vizCrumbs');
-  const parts = vizState.trail.map((t, i) => {
-    const last = i === vizState.trail.length - 1;
-    return `<button class="crumb ${last ? 'cur' : ''}" data-crumb="${i}"${last ? ' disabled' : ''}>${esc(t.id)}</button>`;
-  });
-  el.innerHTML = parts.join('<span style="color:var(--ink3)">›</span>')
-    + `<span id="vizCaption" class="note" style="margin-left:14px;flex:1;min-width:220px"></span>`;
-  el.querySelectorAll('[data-crumb]').forEach(b => b.onclick = () => {
-    const i = Number(b.dataset.crumb);
-    vizState.trail = vizState.trail.slice(0, i + 1);
-    const t = vizState.trail[i];
-    vizState.type = t.type; vizState.id = t.id;
-    renderApp();
-  });
-}
-
-function vizPivot(type, id) {
-  if (type === 'app') {
-    if (!applications.has(id)) return;
-    if (id !== selectedApp) { selectedApp = id; document.getElementById('envFilter').value = 'ALL'; renderAppList(); }
-    vizState = { type:'app', id, trail:[{ type:'app', id }] };
-  } else {
-    if (!instances.has(id)) return;
-    const last = vizState.trail[vizState.trail.length - 1];
-    if (last && last.type === type && last.id === id) return;
-    vizState.type = 'inst'; vizState.id = id;
-    vizState.trail.push({ type:'inst', id });
-    if (vizState.trail.length > 6) vizState.trail.shift();
-  }
-  renderApp();
-}
 
 /* ---------------------------------------------------------------------------
    Header
@@ -1672,18 +1503,14 @@ function renderAppList() {
   const names = [...applications.keys()].sort(byName).filter(n => n.toLowerCase().includes(q));
   document.getElementById('appList').innerHTML = names.length ? names.map(n => {
     const a = applications.get(n);
-    const dbs = a.dbs.slice().sort((x, y) => envRank(x.environment) - envRank(y.environment) || byName(x.database, y.database));
-    const shown = dbs.slice(0, 22).map(d => dotFor(d, true)).join('');
-    const more = dbs.length > 22 ? `<span class="s" style="display:inline;margin-left:4px">+${dbs.length - 22}</span>` : '';
     return `<button class="app-btn ${n === selectedApp ? 'active' : ''}" data-app="${esc(n)}">
       <b>${esc(n)}</b>
-      <span class="s">${uniq(a.dbs.map(d => d.instance)).length} instances &middot; ${a.dbs.length} databases</span>
-      <span class="dots sm" style="margin-top:6px">${shown}${more}</span></button>`;
+      <span class="s">${uniq(a.dbs.map(d => d.instance)).length} SQL instances &middot; ${a.dbs.length} databases</span>
+      ${spreadHtml(a.dbs)}</button>`;
   }).join('') : '<div class="empty">No applications match.</div>';
   document.querySelectorAll('#appList [data-app]').forEach(b => b.onclick = () => {
     selectedApp = b.dataset.app;
     document.getElementById('envFilter').value = 'ALL';
-    vizState = { type:'app', id:selectedApp, trail:[{ type:'app', id:selectedApp }] };
     renderAppList(); renderApp();
   });
 }
@@ -1691,7 +1518,6 @@ function renderAppList() {
 function renderApp() {
   if (!selectedApp) return;
   const app = applications.get(selectedApp);
-  if (!vizState.trail.length) vizState = { type:'app', id:selectedApp, trail:[{ type:'app', id:selectedApp }] };
   const filter = document.getElementById('envFilter');
 
   const envs = uniq(app.rows.map(r => r.environment)).sort((a, b) => envRank(a) - envRank(b));
@@ -1711,7 +1537,7 @@ function renderApp() {
 
   document.getElementById('appKpis').innerHTML = [
     ['Application MTTR', fmtH(m.complete), 'One team, one instance at a time', 'var(--crit)'],
-    ['Databases in scope', m.dbs.length, `${m.mix.measured + m.mix.derived} with a restore figure, ${m.mix.none} NULL`, 'var(--info)'],
+    ['Databases in scope', m.dbs.length, m.dbs.length ? spreadHtml(m.dbs) : 'None in this filter', 'var(--info)'],
     ['SQL instances', m.legs.length, m.collateral.length ? `${m.collateral.length} other applications on the same hosts` : 'No other application shares these hosts', 'var(--accent)'],
     ['Data to restore', fmtGb(gb), gb === null ? 'No size captured yet' : `across ${sized.length} sized databases`, 'var(--high)']
   ].map(kpiHtml).join('');
@@ -1724,18 +1550,95 @@ function renderApp() {
     box.classList.remove('hidden');
   } else { box.classList.add('hidden'); }
 
-  /* Parallel recovery is offered as a way to bring the figure down, not assumed. */
-  const options = [];
-  if (m.legs.length > 1 && m.ifParallel !== null) {
-    options.push(`recovering all ${m.legs.length} instances at the same time instead of one after another brings it to <b>${hoursText(m.ifParallel)}</b>`);
-  }
-  options.push('a synchronous replica or a warm standby takes the restore off the critical path altogether');
-  if (m.mix.none > 0) options.push(`${m.mix.none} database${m.mix.none === 1 ? ' is' : 's are'} NULL and excluded from the figure, so the real number is higher until they are collected`);
-  document.getElementById('appReduce').innerHTML =
-    `<div class="callout"><b>Ways to bring this down.</b> The figure above assumes one database restored at a time, which is the longest it can take &mdash; ${options.join('; ')}.</div>`;
+  const quantified = m.mix.measured + m.mix.derived;
+  document.getElementById('appNote').innerHTML = m.dbs.length
+    ? `${quantified} of ${m.dbs.length} databases have a restore figure behind them`
+      + (m.mix.none
+          ? `; the other ${m.mix.none} ${m.mix.none === 1 ? 'is' : 'are'} NULL and excluded from the MTTR above, so the real figure is higher until they are collected.`
+          : `. Every database in scope is quantified.`)
+    : '';
 
-  renderAppViz(app, m);
+  renderAppTopology(app, m);
   renderAppEnvironments(app, m, filter.value);
+}
+
+/* The relationship map: application, environment, SQL instance, databases. */
+function renderAppTopology(app, m) {
+  const el = document.getElementById('appTopo');
+  const legendEl = document.getElementById('appTopoLegend');
+
+  if (!m.legs.length) {
+    el.innerHTML = '<div class="empty">No databases for this filter.</div>';
+    legendEl.innerHTML = '';
+    return;
+  }
+
+  const byEnv = new Map();
+  m.legs.forEach(leg => {
+    const e = leg.instance.environment;
+    if (!byEnv.has(e)) byEnv.set(e, []);
+    byEnv.get(e).push(leg);
+  });
+
+  const cards = [...byEnv.entries()].sort((a, b) => envRank(a[0]) - envRank(b[0])).map(([environment, legs]) => {
+    const envDbs = legs.flatMap(l => l.dbs);
+    const totals = legs.map(l => l.total).filter(t => t !== null);
+    const envTotal = totals.length === legs.length ? sum(totals) : null;
+
+    const stack = legs.slice().sort((a, b) => byName(a.instance.instance, b.instance.instance)).map(leg => {
+      const inst = leg.instance;
+      const release = versionLabel(inst.meta);
+      const chips = leg.dbs.map(d => {
+        const r = restoreOf(d);
+        const tip = `${d.database} (${d.environment}) on ${d.instance}\n${gbText(d.sizeGb)} · restore ${hoursText(r.minutes)} · ${r.label}\n${r.detail}`;
+        return `<span class="dbchip" style="--basis-c:${BASIS_HEX[r.basis]}" title="${esc(tip)}">`
+             + `<b>${esc(d.database)}</b><span>${esc(hoursText(r.minutes))}</span></span>`;
+      }).join('');
+
+      return `<div class="inst-node">
+        <div class="inst-top">
+          <div style="min-width:0">
+            <button class="inst-link" data-instance="${esc(inst.instance)}">${esc(inst.instance)}</button> ${envTag(inst.environment)}
+            <div class="inst-meta">Host ${nz(inst.server)} &middot; ${release ? esc(release) : NUL}${inst.siblings ? ` &middot; ${inst.siblings} other instance${inst.siblings === 1 ? '' : 's'} on this host` : ''}</div>
+          </div>
+          <div class="inst-fig"><b>${leg.dbs.length}</b> databases<br><b>${fmtH(leg.total)}</b> this leg</div>
+        </div>
+        <div class="dbchips">${chips}</div>
+      </div>`;
+    }).join('');
+
+    return `<div class="env-card" style="--env-c:${envHex(environment)}">
+      <div class="eh">
+        <div class="env-circle">${esc(environment)}</div>
+        <div class="env-sum">
+          <b>${legs.length} SQL instance${legs.length === 1 ? '' : 's'}</b>
+          <span>${envDbs.length} database${envDbs.length === 1 ? '' : 's'} &middot; ${hoursText(envTotal)} to recover this environment</span>
+        </div>
+      </div>
+      <div class="inst-stack">${stack}</div>
+    </div>`;
+  }).join('');
+
+  el.innerHTML = `<div class="flow-root"><div class="root-circle">
+      <b>${esc(app.name)}</b>
+      <span>${m.dbs.length} database${m.dbs.length === 1 ? '' : 's'}<br>${m.legs.length} SQL instance${m.legs.length === 1 ? '' : 's'}<br>${esc(spreadText(m.dbs))}</span>
+    </div></div>
+    <div class="pointer-line"></div>
+    <div class="env-grid">${cards}</div>`;
+
+  el.querySelectorAll('[data-instance]').forEach(b => b.onclick = () => {
+    selectedInstance = b.dataset.instance;
+    renderInstanceList();
+    renderInstanceDetail();
+    showView('serverView');
+  });
+
+  legendEl.innerHTML =
+    envCounts(m.dbs).map(([e, n]) => `<span><i class="sw" style="background:${envHex(e)}"></i>${esc(e)} ${n}</span>`).join('')
+    + `<span style="margin-left:14px"><i class="rd" style="background:${BASIS_HEX.measured}"></i>measured</span>`
+    + `<span><i class="rd" style="background:${BASIS_HEX.derived}"></i>derived</span>`
+    + `<span><i class="rd" style="background:${BASIS_HEX.none}"></i>NULL</span>`
+    + `<span style="margin-left:auto;color:var(--ink3)">The coloured edge of each database is the basis of its restore time.</span>`;
 }
 
 /* Environment by environment, then instance by instance, then the databases inside. */
@@ -1762,7 +1665,6 @@ function renderAppEnvironments(app, m, filterValue) {
       return `<details class="inst">
         <summary>
           <span><span class="inst-name">${esc(inst.instance)}</span> ${envTag(inst.environment)}
-            <span class="dots sm" style="margin-left:8px">${leg.dbs.map(d => dotFor(d, true)).join('')}</span>
             <div class="inst-sub">Host ${nz(inst.server)}${inst.siblings ? ` &middot; ${inst.siblings} other instance${inst.siblings === 1 ? '' : 's'} on this host` : ''} &middot; ${mechanisms.length ? esc(mechanisms.join(', ')) : NUL + ' replication / HA'}</div></span>
           <span class="inst-figs">
             <span><b>${leg.dbs.length}</b>databases</span>
@@ -1773,7 +1675,7 @@ function renderAppEnvironments(app, m, filterValue) {
         <div class="inst-body">
           <div class="meta" style="grid-template-columns:repeat(3,1fr)">
             <div class="meta-box"><b>Instance rebuild</b><span>${fmtH(leg.buildMinutes)}</span></div>
-            <div class="meta-box"><b>SQL version</b><span>${nz(inst.meta && inst.meta.version ? inst.meta.version + (inst.meta.productLevel ? ' ' + inst.meta.productLevel : '') : null)}</span></div>
+            <div class="meta-box"><b>SQL version</b><span>${nz(versionFull(inst.meta))}</span></div>
             <div class="meta-box"><b>Other applications here</b><span>${shared.length ? esc(shared.join(', ')) : 'None'}</span></div>
           </div>
           <div class="tbl-wrap"><table class="table">
@@ -1818,13 +1720,13 @@ function renderInstanceList() {
   const list = [...instances.values()]
     .filter(i => i.instance.toLowerCase().includes(q))
     .sort((a, b) => byName(a.instance, b.instance));
-  document.getElementById('srvList').innerHTML = list.length ? list.map(i =>
-    `<button class="srv-btn ${i.instance === selectedInstance ? 'active' : ''}" data-instance="${esc(i.instance)}">
+  document.getElementById('srvList').innerHTML = list.length ? list.map(i => {
+    const release = versionLabel(i.meta);
+    return `<button class="srv-btn ${i.instance === selectedInstance ? 'active' : ''}" data-instance="${esc(i.instance)}">
       <b>${esc(i.instance)}</b> ${envTag(i.environment)}
-      <span class="s">${i.databases.length} database${i.databases.length === 1 ? '' : 's'}${i.siblings ? ` &middot; shares host with ${i.siblings} other` : ''}</span>
-      <span class="dots sm" style="margin-top:5px">${i.databases.slice(0, 22).map(d => dotFor(d, true)).join('')}</span>
-    </button>`).join('')
-    : '<div class="empty">No SQL instances match.</div>';
+      <span class="s">${i.databases.length} database${i.databases.length === 1 ? '' : 's'} &middot; ${release ? esc(release) : NUL}${i.siblings ? `<br>shares host with ${i.siblings} other instance${i.siblings === 1 ? '' : 's'}` : ''}</span>
+    </button>`;
+  }).join('') : '<div class="empty">No SQL instances match.</div>';
   document.querySelectorAll('#srvList [data-instance]').forEach(b => b.onclick = () => {
     selectedInstance = b.dataset.instance; renderInstanceList(); renderInstanceDetail();
   });
@@ -1854,7 +1756,7 @@ function renderInstanceDetail() {
 
     <div class="meta">
       <div class="meta-box"><b>Host</b><span>${nz(inst.server)}</span></div>
-      <div class="meta-box"><b>SQL version</b><span>${nz(meta && meta.version ? `${meta.version}${meta.productLevel ? ' ' + meta.productLevel : ''}` : null)}</span></div>
+      <div class="meta-box"><b>SQL version</b><span>${nz(versionFull(meta))}</span></div>
       <div class="meta-box"><b>Edition</b><span>${nz(meta && meta.edition ? meta.edition : null)}</span></div>
       <div class="meta-box"><b>Connectivity</b><span><span class="status ${slug(connectivity)}">${esc(connectivity)}</span></span></div>
       <div class="meta-box"><b>Replication / HA design</b><span>${mechanisms.length ? esc(mechanisms.join(', ')) : NUL}</span></div>
@@ -1904,13 +1806,13 @@ function renderDeck() {
     ? dbTimes.slice().sort((a, b) => a.r.minutes - b.r.minutes)[Math.floor(dbTimes.length / 2)] : null;
 
   document.getElementById('deckLead').textContent =
-    `${applications.size} applications run on ${instances.size} SQL instances holding ${databases.size} databases. `
-    + `This is what it currently takes to bring each of those back, one database at a time. `
+    `${applications.size} applications run on ${instances.size} SQL instances holding ${databases.size} databases `
+    + `(${spreadText(allDbs)}). This is what it currently takes to bring each of those back, one database at a time. `
     + `${withFigure} of ${databases.size} databases have a restore figure behind them; the rest are NULL until they are collected.`;
 
   document.getElementById('deckKpis').innerHTML = [
     ['Applications in scope', applications.size, `${[...instances.values()].filter(i => i.appList.length > 1).length} SQL instances carry more than one`, 'var(--accent)'],
-    ['Databases to recover', databases.size, totalGb === null ? 'Sizes not captured yet' : `${gbText(totalGb)} across ${sized.length} sized databases`, 'var(--info)'],
+    ['Databases to recover', databases.size, spreadHtml(allDbs), 'var(--info)'],
     ['Longest single instance loss', worstInstance ? fmtH(worstInstance.m.complete) : NUL,
       worstInstance ? esc(worstInstance.inst.instance) : 'Enter the rebuild hours on the Framework panel', 'var(--crit)'],
     ['Production instances', [...instances.values()].filter(i => isProd(i.environment)).length, `of ${instances.size} total`, 'var(--high)']
@@ -1977,11 +1879,6 @@ document.querySelectorAll('.nav-tab').forEach(b => b.onclick = () => showView(b.
 document.getElementById('appSearch').addEventListener('input', renderAppList);
 document.getElementById('srvSearch').addEventListener('input', renderInstanceList);
 document.getElementById('envFilter').addEventListener('change', renderApp);
-document.getElementById('appViz').addEventListener('click', e => {
-  const g = e.target.closest('.nodeG');
-  if (!g) return;
-  vizPivot(g.dataset.type, g.dataset.id);
-});
 
 loadAssumptions();
 renderAll();
@@ -2023,6 +1920,9 @@ $collected = @($instanceMeta | Where-Object { $_.status -eq 'Collected' }).Count
 Write-Host ''
 Write-Host 'Created: ' -NoNewline -ForegroundColor Green; Write-Host $OutputHtml
 Write-Host ("  Applications {0}   SQL instances {1}   Databases {2}   Workbook rows {3}" -f $applicationCount, $instanceNames.Count, $databaseCount, $inventory.Count) -ForegroundColor Cyan
+
+$environmentSpread = ($inventory | Group-Object Environment | Sort-Object Name | ForEach-Object { '{0} {1}' -f $_.Name, $_.Count }) -join '   '
+Write-Host ("  Environment spread: {0}" -f $environmentSpread) -ForegroundColor Cyan
 
 if ($CollectSqlEvidence) {
     Write-Host ("  Evidence collected from {0} of {1} instances" -f $collected, $instanceNames.Count) -ForegroundColor Cyan
