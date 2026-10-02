@@ -1,0 +1,8 @@
+Columns from 1st excel 
+ServerName	Environment	SQLVersion	BusinessUnit	APMAppID	ApplicationCriticality	ApplicationName	CostCenter	Location	Platform	PhysicalMemoryGB	LogicalCPUCount	Port	PrimaryITOwner	SecondaryITOwner	Size	Subscription	VirtualNetwork	Subnet
+
+
+
+Columns from 2nd excel 
+
+DatabaseType	ServerName	DatabaseName	DatabaseSizeMB	DatabaseStatus	Environment	SQLVersion	BusinessUnit	ApplicationName	PrimaryITOwner	SecondaryITOwner	AGName	CompatibilityLevel	DatabaseClassification	DatabaseCollationName	ListenerName	PageVerifyOption	Platform	RecoveryModel	InventoryDate - Year	InventoryDate - Quarter	InventoryDate - Month	InventoryDate - Day

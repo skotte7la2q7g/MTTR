@@ -1,0 +1,2773 @@
+﻿#Requires -Version 5.1
+<#
+=========================================================================================
+ SQL APPLICATION RESILIENCE AND MTTR FRAMEWORK
+-----------------------------------------------------------------------------------------
+ WHAT THIS PRODUCES
+   One self-contained HTML file with four panels, read in this order:
+
+     1. Framework & MTTR     The explanation. What the framework is, the three failure
+                             scenarios, the replication mechanisms, how every restore
+                             time was arrived at, and the assumptions you own.
+     2. Application Overview The application at the top of a relationship map, then one
+                             card per environment, then the SQL instances inside it, then
+                             the databases on each instance. Click an instance name to
+                             jump to its full recovery scope.
+     3. SQL Instance MTTR    Pick a SQL instance and see every database on it and how
+                             long the whole instance takes to bring back.
+     4. Executive Deck       Work in progress. One screen that says what this is.
+
+ SCENARIO RUN-DOWN
+   Panels 2 and 3 each carry a scenario drop-down, and the report walks the chosen failure
+   step by step: what is rebuilt, which databases are restored in what order, how long
+   each step takes and on what evidence, the clock after each step, which applications
+   are down, and what the observed backup, recovery-model and replication facts mean.
+
+     Application Overview   Whole application is lost
+                            Database corruption - restore from backup (databases you tick)
+     SQL Instance MTTR      Whole SQL instance is lost (the VM survives)
+                            Database corruption - restore from backup (databases you tick)
+                            Whole VM is lost (every SQL instance on it)
+
+ SIMULATOR
+   -Simulate builds the whole report from a built-in, made-up estate - no workbook, no
+   Excel, no SQL Server, nothing contacted. Every name starts SIM and every page carries a
+   SIMULATED banner. Use it to see the report and try every scenario before touching the
+   real estate, or to show someone what the output looks like. Its assumption values are
+   saved separately, so they never overwrite the ones entered for a real report.
+
+ COUNTS, NOT MARKERS
+   Where a set of databases is summarised it is stated as a number and an environment
+   spread - "6 databases, PROD 4 / UAT 1 / DEV 1" - never as a row of markers you would
+   have to count yourself.
+
+ TWO RULES THE WHOLE REPORT FOLLOWS
+   1. Anything not known prints as NULL. Never as zero, never as an average, and never
+      dressed up in a phrase. NULL is a fact: it says go and collect this.
+   2. Recovery is counted one database at a time, one instance at a time. That is the
+      longest it can take, and it is the only figure worth planning against.
+
+ HOW A RESTORE TIME IS ARRIVED AT
+   Every database resolves down a three-rung ladder and the rung is printed next to the
+   number, everywhere the number appears:
+
+     1. MEASURED   A restore that was actually timed on this database.
+     2. DERIVED    This database's own measured backup throughput from msdb, multiplied
+                   by a single named restore factor the operator owns.
+     3. NULL       No timed restore and no backup history. Nothing is invented.
+
+ INPUTS
+   Required : an Excel workbook with sheets 'Prod_DBInventory' and 'NonProd_Inventory'.
+              Any other sheet carrying an 'Application Name' column is read as extra
+              per-application metadata and shown on the application panel.
+   Optional : -CollectSqlEvidence connects read-only to each instance and reads msdb for
+              backup and restore history, sys.databases for size and compatibility level,
+              and the HA/DR configuration. Without it the report still builds and the
+              unmeasured fields read NULL.
+
+ SAFETY
+   Every statement issued against SQL Server is a SELECT. Nothing is created, altered or
+   dropped. Connections are tagged Application Name=SQL-MTTR-Framework so anyone asking
+   "what is this session" can see.
+
+ USAGE
+   .\New-MttrFramework.ps1 -Simulate                                       # made-up estate
+   .\New-MttrFramework.ps1
+   .\New-MttrFramework.ps1 -SourceWorkbook .\Estate.xlsx -CollectSqlEvidence
+   .\New-MttrFramework.ps1 -SourceWorkbook .\Estate.xlsx -CollectSqlEvidence -TestConnectivity
+   .\New-MttrFramework.ps1 -SourceWorkbook .\Estate.xlsx -Palette Slate    # unbranded copy
+=========================================================================================
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $false)]
+    [string]$SourceWorkbook = '',
+
+    [Parameter(Mandatory = $false)]
+    [string]$OutputHtml = '',
+
+    [Parameter(Mandatory = $false)]
+    [string]$DetailsWorksheet = '',
+
+    # TCP reachability test against each instance endpoint. Cheap, no credentials needed.
+    [Parameter(Mandatory = $false)]
+    [switch]$TestConnectivity,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(100, 60000)]
+    [int]$ConnectivityTimeoutMs = 1200,
+
+    # Read-only collection from msdb and sys.* . This is what turns NULLs into numbers.
+    [Parameter(Mandatory = $false)]
+    [switch]$CollectSqlEvidence,
+
+    [Parameter(Mandatory = $false)]
+    [pscredential]$SqlCredential,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(5, 300)]
+    [int]$SqlTimeoutSeconds = 20,
+
+    # How far back to look for backup and restore evidence.
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(7, 3650)]
+    [int]$EvidenceWindowDays = 180,
+
+    # Where a timed-restore log might live (Ola Hallengren's CommandLog, or your own).
+    [Parameter(Mandatory = $false)]
+    [string[]]$CommandLogDatabase = @('master', 'msdb', 'DBA', 'DBAdmin'),
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet('Manulife', 'Slate')]
+    [string]$Palette = 'Manulife',
+
+    # Build the report from a built-in, made-up estate. Nothing is read or contacted.
+    [Parameter(Mandatory = $false)]
+    [switch]$Simulate,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$NoLaunch
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+trap { Write-Host ("FAILED at line {0}: {1}" -f $_.InvocationInfo.ScriptLineNumber, $_.Exception.Message) -ForegroundColor Red; break }
+
+# =========================================================================================
+# REGION  Input helpers
+# =========================================================================================
+
+function Select-ExcelWorkbook {
+    Add-Type -AssemblyName System.Windows.Forms
+    $dialog = New-Object System.Windows.Forms.OpenFileDialog
+    $dialog.Title = 'Select the application / SQL inventory workbook'
+    $dialog.Filter = 'Excel workbooks (*.xlsx;*.xlsm;*.xls)|*.xlsx;*.xlsm;*.xls|All files (*.*)|*.*'
+    $dialog.FilterIndex = 1
+    $dialog.CheckFileExists = $true
+    $dialog.CheckPathExists = $true
+    $dialog.Multiselect = $false
+    $dialog.RestoreDirectory = $true
+    if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
+        throw 'No Excel workbook was selected. The report was not generated.'
+    }
+    return $dialog.FileName
+}
+
+function ConvertTo-NormalizedName {
+    param([AllowNull()][string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    return (($Value -replace '\s+', ' ').Trim())
+}
+
+function Get-HostAndPort {
+    param([string]$Instance)
+    $value = ConvertTo-NormalizedName $Instance
+    $port = 1433
+    if ($value -match ',\s*(\d+)\s*$') {
+        $port = [int]$Matches[1]
+        $value = $value -replace ',\s*\d+\s*$', ''
+    }
+    $hostName = ($value -split '\\')[0]
+    [pscustomobject]@{ Host = $hostName; Port = $port }
+}
+
+function Test-TcpEndpoint {
+    param([string]$HostName, [int]$Port, [int]$TimeoutMs)
+    if ([string]::IsNullOrWhiteSpace($HostName)) { return 'Unknown' }
+    $client = [System.Net.Sockets.TcpClient]::new()
+    try {
+        $task = $client.ConnectAsync($HostName, $Port)
+        if (-not $task.Wait($TimeoutMs)) { return 'Disconnected' }
+        if ($client.Connected) { return 'Connected' }
+        return 'Disconnected'
+    }
+    catch { return 'Disconnected' }
+    finally { $client.Dispose() }
+}
+
+function Read-ExcelWorksheet {
+    param([Parameter(Mandatory)]$Workbook, [Parameter(Mandatory)][string]$WorksheetName)
+    try { $sheet = $Workbook.Worksheets.Item($WorksheetName) }
+    catch { throw "Worksheet '$WorksheetName' was not found in the workbook. Expected sheets named 'Prod_DBInventory' and 'NonProd_Inventory'." }
+
+    $used = $sheet.UsedRange
+    $values = $used.Value2
+    if ($null -eq $values) { return @() }
+
+    $rowCount = $used.Rows.Count
+    $columnCount = $used.Columns.Count
+    $headers = @{}
+    for ($column = 1; $column -le $columnCount; $column++) {
+        $name = ConvertTo-NormalizedName ([string]$values[1, $column])
+        if ($name) { $headers[$name.ToLowerInvariant()] = $column }
+    }
+
+    $rows = [System.Collections.Generic.List[object]]::new()
+    for ($rowNumber = 2; $rowNumber -le $rowCount; $rowNumber++) {
+        $row = [ordered]@{}
+        foreach ($header in $headers.Keys) {
+            $row[$header] = ConvertTo-NormalizedName ([string]$values[$rowNumber, $headers[$header]])
+        }
+        if (($row.Values | Where-Object { $_ }).Count -gt 0) { $rows.Add([pscustomobject]$row) }
+    }
+    return $rows.ToArray()
+}
+
+function Read-ApplicationDetails {
+    param([Parameter(Mandatory)]$Workbook, [string]$RequestedWorksheet = '')
+
+    $excluded = @('prod_dbinventory', 'nonprod_inventory')
+    $applicationHeaders = @('application name', 'application', 'app name', 'appname')
+    $candidateSheets = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($sheet in @($Workbook.Worksheets)) {
+        $sheetName = ConvertTo-NormalizedName ([string]$sheet.Name)
+        if ($excluded -contains $sheetName.ToLowerInvariant()) { continue }
+        if ($RequestedWorksheet -and $sheetName -ne $RequestedWorksheet) { continue }
+
+        $used = $sheet.UsedRange
+        if ($used.Rows.Count -lt 2 -or $used.Columns.Count -lt 2) { continue }
+        $values = $used.Value2
+        $headers = [System.Collections.Generic.List[object]]::new()
+        $applicationColumn = 0
+
+        for ($column = 1; $column -le $used.Columns.Count; $column++) {
+            $displayName = ConvertTo-NormalizedName ([string]$values[1, $column])
+            if (-not $displayName) { continue }
+            $headers.Add([pscustomobject]@{ Name = $displayName; Column = $column })
+            if ($applicationHeaders -contains $displayName.ToLowerInvariant()) { $applicationColumn = $column }
+        }
+
+        if ($applicationColumn -gt 0) {
+            $candidateSheets.Add([pscustomobject]@{
+                Sheet = $sheet; Name = $sheetName; Values = $values
+                Headers = $headers.ToArray(); ApplicationColumn = $applicationColumn
+                RowCount = $used.Rows.Count
+            })
+        }
+    }
+
+    if ($RequestedWorksheet -and $candidateSheets.Count -eq 0) {
+        throw "Details worksheet '$RequestedWorksheet' was not found, or has no Application Name column."
+    }
+
+    $records = [System.Collections.Generic.List[object]]::new()
+    foreach ($candidate in $candidateSheets) {
+        for ($rowNumber = 2; $rowNumber -le $candidate.RowCount; $rowNumber++) {
+            $application = ConvertTo-NormalizedName ([string]$candidate.Values[$rowNumber, $candidate.ApplicationColumn])
+            if (-not $application) { continue }
+            $fields = [System.Collections.Generic.List[object]]::new()
+            foreach ($header in $candidate.Headers) {
+                if ($header.Column -eq $candidate.ApplicationColumn) { continue }
+                $value = ConvertTo-NormalizedName ([string]$candidate.Values[$rowNumber, $header.Column])
+                if (-not $value) { $value = 'NULL' }
+                $fields.Add([ordered]@{ label = $header.Name; value = $value; isNull = ($value -eq 'NULL') })
+            }
+            if ($fields.Count -gt 0) {
+                $records.Add([ordered]@{ application = $application; sheet = $candidate.Name; fields = $fields.ToArray() })
+            }
+        }
+    }
+    return $records.ToArray()
+}
+
+function Get-FieldValue {
+    param($Row, [string[]]$Candidates)
+    foreach ($candidate in $Candidates) {
+        $property = $Row.PSObject.Properties[$candidate.ToLowerInvariant()]
+        if ($null -ne $property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+            return ConvertTo-NormalizedName ([string]$property.Value)
+        }
+    }
+    return ''
+}
+
+# =========================================================================================
+# REGION  Read-only SQL Server evidence collection
+#
+#   Everything here degrades. One query failing on one instance costs you that one fact,
+#   not the instance, and never the run. What could not be read is reported as
+#   "not collected", which is a different statement from "nothing there".
+# =========================================================================================
+
+function Invoke-SqlRead {
+    param(
+        [Parameter(Mandatory)][string]$Instance,
+        [string]$Database = 'master',
+        [Parameter(Mandatory)][string]$Query,
+        [int]$TimeoutSeconds = 20,
+        [pscredential]$Credential
+    )
+
+    $connectionString = "Server=$Instance;Database=$Database;Application Name=SQL-MTTR-Framework;Connect Timeout=$TimeoutSeconds;"
+    if ($Credential) {
+        $connectionString += ('User ID={0};Password={1};' -f $Credential.UserName, $Credential.GetNetworkCredential().Password)
+    }
+    else {
+        $connectionString += 'Integrated Security=SSPI;'
+    }
+
+    $connection = New-Object System.Data.SqlClient.SqlConnection $connectionString
+    try {
+        $connection.Open()
+        $command = $connection.CreateCommand()
+        $command.CommandText = $Query
+        $command.CommandTimeout = $TimeoutSeconds
+        $table = New-Object System.Data.DataTable
+        $reader = $command.ExecuteReader()
+        $table.Load($reader)
+        $reader.Close()
+
+        $rows = [System.Collections.Generic.List[object]]::new()
+        foreach ($dataRow in $table.Rows) {
+            $item = [ordered]@{}
+            foreach ($column in $table.Columns) {
+                $value = $dataRow[$column.ColumnName]
+                $item[$column.ColumnName] = $(if ($value -is [System.DBNull]) { $null } else { $value })
+            }
+            $rows.Add([pscustomobject]$item)
+        }
+        return $rows.ToArray()
+    }
+    finally { $connection.Dispose() }
+}
+
+# "A network-related or instance-specific error occurred" tells the reader nothing and is the
+# single most common thing a first-time runner will see. Name the actual cause and the fix.
+function Get-ConnectionDiagnosis {
+    param([string]$Message)
+
+    $text = $Message
+    $marker = 'argument(s): "'
+    $position = $text.IndexOf($marker)
+    if ($position -ge 0) { $text = $text.Substring($position + $marker.Length).TrimEnd('"') }
+    $text = ($text -replace '\s+', ' ').Trim()
+
+    if ($text -match 'error: 26|Error Locating Server') {
+        return 'Named instance could not be resolved. SQL Browser on UDP 1434 is usually blocked - use SERVER,PORT instead of SERVER\INSTANCE.'
+    }
+    if ($text -match 'error: 40|server was not found') {
+        return 'Server not found, or not accepting remote connections. Check the name first, then the firewall on TCP 1433.'
+    }
+    if ($text -match 'Login failed') {
+        return 'Reached the instance but the login was refused. Grant the account VIEW SERVER STATE and read access to msdb.'
+    }
+    if ($text -match 'timeout expired|pre-login|period of time') {
+        return 'No response before the connection timeout expired. Raise -SqlTimeoutSeconds, or the instance is down.'
+    }
+    if ($text -match 'permission|denied|principal') {
+        return 'Reached the instance but the account cannot read the evidence. Needs VIEW SERVER STATE and msdb db_datareader.'
+    }
+    if ($text.Length -gt 180) { $text = $text.Substring(0, 180) + '...' }
+    return $text
+}
+
+function Get-SqlInstanceEvidence {
+    param(
+        [Parameter(Mandatory)][string]$Instance,
+        [int]$TimeoutSeconds,
+        [pscredential]$Credential,
+        [int]$WindowDays,
+        [string[]]$CommandLogDatabase
+    )
+
+    $evidence = [ordered]@{
+        instance = $Instance; status = 'Unreachable'; message = ''
+        machine = ''; version = ''; productLevel = ''; edition = ''
+        isClustered = $false; isHadrEnabled = $false
+        modules = [ordered]@{}
+        databases = @{}
+    }
+
+    # --- Instance identity. If this fails the instance is genuinely unreachable. -------------
+    try {
+        $facts = Invoke-SqlRead -Instance $Instance -TimeoutSeconds $TimeoutSeconds -Credential $Credential -Query @"
+SELECT
+    CAST(SERVERPROPERTY('MachineName')    AS nvarchar(200)) AS MachineName,
+    CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(50))  AS ProductVersion,
+    CAST(SERVERPROPERTY('ProductLevel')   AS nvarchar(50))  AS ProductLevel,
+    CAST(SERVERPROPERTY('Edition')        AS nvarchar(200)) AS Edition,
+    CAST(ISNULL(SERVERPROPERTY('IsClustered'),0)   AS int)  AS IsClustered,
+    CAST(ISNULL(SERVERPROPERTY('IsHadrEnabled'),0) AS int)  AS IsHadrEnabled;
+"@
+        if ($facts.Count -gt 0) {
+            $evidence.status = 'Collected'
+            $evidence.machine = [string]$facts[0].MachineName
+            $evidence.version = [string]$facts[0].ProductVersion
+            $evidence.productLevel = [string]$facts[0].ProductLevel
+            $evidence.edition = [string]$facts[0].Edition
+            $evidence.isClustered = ([int]$facts[0].IsClustered -eq 1)
+            $evidence.isHadrEnabled = ([int]$facts[0].IsHadrEnabled -eq 1)
+        }
+    }
+    catch {
+        $evidence.message = Get-ConnectionDiagnosis $_.Exception.Message
+        return $evidence
+    }
+
+    function Add-DbFact {
+        param($Store, [string]$Name, [hashtable]$Values)
+        if ([string]::IsNullOrWhiteSpace($Name)) { return }
+        $key = $Name.ToUpperInvariant()
+        if (-not $Store.ContainsKey($key)) { $Store[$key] = [ordered]@{ name = $Name } }
+        foreach ($entry in $Values.GetEnumerator()) { $Store[$key][$entry.Key] = $entry.Value }
+    }
+
+    # --- Size, compatibility level, recovery model, state -------------------------------------
+    try {
+        $databases = Invoke-SqlRead -Instance $Instance -TimeoutSeconds $TimeoutSeconds -Credential $Credential -Query @"
+SELECT  d.name                                                       AS DatabaseName,
+        d.compatibility_level                                        AS CompatibilityLevel,
+        d.recovery_model_desc                                        AS RecoveryModel,
+        d.state_desc                                                 AS State,
+        d.is_published, d.is_subscribed, d.is_merge_published,
+        CAST(SUM(CAST(mf.size AS bigint)) * 8.0 / 1048576.0 AS decimal(18,2)) AS SizeGB
+FROM    sys.databases d
+LEFT JOIN sys.master_files mf ON mf.database_id = d.database_id
+GROUP BY d.name, d.compatibility_level, d.recovery_model_desc, d.state_desc,
+         d.is_published, d.is_subscribed, d.is_merge_published;
+"@
+        foreach ($database in $databases) {
+            Add-DbFact $evidence.databases ([string]$database.DatabaseName) @{
+                sizeGb        = $(if ($null -ne $database.SizeGB) { [double]$database.SizeGB } else { $null })
+                compatibility = $(if ($null -ne $database.CompatibilityLevel) { [int]$database.CompatibilityLevel } else { $null })
+                recoveryModel = [string]$database.RecoveryModel
+                state         = [string]$database.State
+                isReplicated  = (([int]$database.is_published -eq 1) -or ([int]$database.is_subscribed -eq 1) -or ([int]$database.is_merge_published -eq 1))
+            }
+        }
+        $evidence.modules['Databases'] = 'Collected'
+    }
+    catch { $evidence.modules['Databases'] = "Failed: $($_.Exception.Message)" }
+
+    # --- Measured backup throughput. This is the honest basis for a restore estimate. ---------
+    #     Throughput is measured on this database, on this instance, on this storage.
+    #     The last full and last log backup dates count every backup; only the throughput
+    #     average skips the sub-second ones, which have no measurable duration.
+    try {
+        $backups = Invoke-SqlRead -Instance $Instance -TimeoutSeconds $TimeoutSeconds -Credential $Credential -Query @"
+SELECT  bs.database_name                                                       AS DatabaseName,
+        MAX(CASE WHEN bs.type = 'D' THEN bs.backup_finish_date END)            AS LastFullBackup,
+        MAX(CASE WHEN bs.type = 'L' THEN bs.backup_finish_date END)            AS LastLogBackup,
+        SUM(CASE WHEN bs.type = 'D' AND bs.backup_size > 0
+                  AND DATEDIFF(SECOND, bs.backup_start_date, bs.backup_finish_date) > 0
+                 THEN 1 ELSE 0 END)                                            AS Samples,
+        AVG(CASE WHEN bs.type = 'D' AND bs.backup_size > 0
+                  AND DATEDIFF(SECOND, bs.backup_start_date, bs.backup_finish_date) > 0
+                 THEN CAST(DATEDIFF(SECOND, bs.backup_start_date, bs.backup_finish_date) AS bigint) END) AS AvgSeconds,
+        AVG(CASE WHEN bs.type = 'D' AND bs.backup_size > 0
+                  AND DATEDIFF(SECOND, bs.backup_start_date, bs.backup_finish_date) > 0
+                 THEN CAST(bs.backup_size / 1048576.0 AS float) END)           AS AvgMegabytes
+FROM    msdb.dbo.backupset bs
+WHERE   bs.type IN ('D', 'L')
+  AND   bs.backup_finish_date > DATEADD(DAY, -$WindowDays, GETDATE())
+GROUP BY bs.database_name;
+"@
+        foreach ($backup in $backups) {
+            $seconds = $(if ($null -ne $backup.AvgSeconds) { [double]$backup.AvgSeconds } else { 0.0 })
+            $megabytes = $(if ($null -ne $backup.AvgMegabytes) { [double]$backup.AvgMegabytes } else { 0.0 })
+            $throughput = $null
+            if ($seconds -gt 0 -and $megabytes -gt 0) { $throughput = [math]::Round($megabytes / $seconds, 2) }
+            Add-DbFact $evidence.databases ([string]$backup.DatabaseName) @{
+                lastFullBackup      = $(if ($null -ne $backup.LastFullBackup) { ([datetime]$backup.LastFullBackup).ToString('yyyy-MM-dd') } else { $null })
+                lastLogBackup       = $(if ($null -ne $backup.LastLogBackup) { ([datetime]$backup.LastLogBackup).ToString('yyyy-MM-dd HH:mm') } else { $null })
+                backupSamples       = [int]$backup.Samples
+                backupThroughputMBs = $throughput
+                backupMinutes       = $(if ($seconds -gt 0) { [math]::Round($seconds / 60.0, 1) } else { $null })
+            }
+        }
+        $evidence.modules['Backup history'] = 'Collected'
+    }
+    catch { $evidence.modules['Backup history'] = "Failed: $($_.Exception.Message)" }
+
+    # --- Has this database ever actually been restored, and when ------------------------------
+    try {
+        $restores = Invoke-SqlRead -Instance $Instance -TimeoutSeconds $TimeoutSeconds -Credential $Credential -Query @"
+SELECT  rh.destination_database_name AS DatabaseName,
+        MAX(rh.restore_date)         AS LastRestore,
+        COUNT(*)                     AS RestoreCount
+FROM    msdb.dbo.restorehistory rh
+WHERE   rh.restore_date > DATEADD(DAY, -$WindowDays, GETDATE())
+GROUP BY rh.destination_database_name;
+"@
+        foreach ($restore in $restores) {
+            Add-DbFact $evidence.databases ([string]$restore.DatabaseName) @{
+                lastRestore  = $(if ($null -ne $restore.LastRestore) { ([datetime]$restore.LastRestore).ToString('yyyy-MM-dd') } else { $null })
+                restoreCount = [int]$restore.RestoreCount
+            }
+        }
+        $evidence.modules['Restore history'] = 'Collected'
+    }
+    catch { $evidence.modules['Restore history'] = "Failed: $($_.Exception.Message)" }
+
+    # --- Last clean DBCC CHECKDB. Says which backups were taken from a database known to be ---
+    #     clean. SQL Server 2016 SP2 and later report it; older builds return NULL, which is
+    #     left as NULL. 1900-01-01 is SQL Server's way of saying no clean check on record.
+    try {
+        $checks = Invoke-SqlRead -Instance $Instance -TimeoutSeconds $TimeoutSeconds -Credential $Credential -Query @"
+SELECT  d.name                                                                  AS DatabaseName,
+        CAST(DATABASEPROPERTYEX(d.name, 'LastGoodCheckDbTime') AS datetime)     AS LastGoodCheckDb
+FROM    sys.databases d
+WHERE   d.state = 0;
+"@
+        foreach ($check in $checks) {
+            if ($null -eq $check.LastGoodCheckDb) { continue }
+            $when = [datetime]$check.LastGoodCheckDb
+            Add-DbFact $evidence.databases ([string]$check.DatabaseName) @{
+                lastGoodCheckDb = $(if ($when.Year -le 1900) { 'Never' } else { $when.ToString('yyyy-MM-dd') })
+            }
+        }
+        $evidence.modules['Integrity checks'] = 'Collected'
+    }
+    catch { $evidence.modules['Integrity checks'] = "Failed: $($_.Exception.Message)" }
+
+    # --- A genuinely timed restore, if anything on this estate logs one ------------------------
+    #     Ola Hallengren's maintenance solution writes CommandLog with StartTime/EndTime.
+    #     Where it exists this is the only truly measured restore duration available.
+    $commandLogFound = $false
+    foreach ($logDatabase in $CommandLogDatabase) {
+        if ($commandLogFound) { break }
+        try {
+            $timed = Invoke-SqlRead -Instance $Instance -Database $logDatabase -TimeoutSeconds $TimeoutSeconds -Credential $Credential -Query @"
+IF OBJECT_ID('dbo.CommandLog') IS NOT NULL
+    SELECT  cl.DatabaseName                                                   AS DatabaseName,
+            COUNT(*)                                                          AS Samples,
+            AVG(CAST(DATEDIFF(SECOND, cl.StartTime, cl.EndTime) AS bigint))   AS AvgSeconds,
+            MAX(cl.EndTime)                                                   AS LastTimedRestore
+    FROM    dbo.CommandLog cl
+    WHERE   cl.CommandType LIKE 'RESTORE%'
+      AND   cl.EndTime IS NOT NULL
+      AND   cl.StartTime > DATEADD(DAY, -$WindowDays, GETDATE())
+      AND   DATEDIFF(SECOND, cl.StartTime, cl.EndTime) > 0
+    GROUP BY cl.DatabaseName;
+"@
+            if ($timed.Count -gt 0) {
+                $commandLogFound = $true
+                foreach ($entry in $timed) {
+                    Add-DbFact $evidence.databases ([string]$entry.DatabaseName) @{
+                        timedRestoreMinutes = [math]::Round(([double]$entry.AvgSeconds) / 60.0, 1)
+                        timedRestoreSamples = [int]$entry.Samples
+                        timedRestoreSource  = "CommandLog in [$logDatabase]"
+                    }
+                }
+                $evidence.modules['Timed restores'] = "Collected from [$logDatabase]"
+            }
+        }
+        catch { }
+    }
+    if (-not $commandLogFound -and -not $evidence.modules.Contains('Timed restores')) {
+        $evidence.modules['Timed restores'] = 'No timed-restore log found'
+    }
+
+    # --- Recovery mechanism. This decides whether a restore is even the recovery path. ---------
+    $mechanisms = @{}
+    if ($evidence.isClustered) { $mechanisms['*'] = 'Failover Cluster Instance' }
+
+    if ($evidence.isHadrEnabled) {
+        try {
+            $availabilityGroups = Invoke-SqlRead -Instance $Instance -TimeoutSeconds $TimeoutSeconds -Credential $Credential -Query @"
+SELECT  DB_NAME(drs.database_id)   AS DatabaseName,
+        ag.name                    AS AgName,
+        ar.availability_mode_desc  AS AvailabilityMode
+FROM    sys.dm_hadr_database_replica_states drs
+JOIN    sys.availability_replicas ar ON ar.replica_id = drs.replica_id
+JOIN    sys.availability_groups   ag ON ag.group_id  = ar.group_id
+WHERE   drs.is_local = 1;
+"@
+            foreach ($group in $availabilityGroups) {
+                $mode = [string]$group.AvailabilityMode
+                $label = "Always On AG '$($group.AgName)'"
+                if ($mode -match 'SYNCHRONOUS') { $label += ' (synchronous)' } elseif ($mode) { $label += ' (asynchronous)' }
+                $mechanisms[([string]$group.DatabaseName).ToUpperInvariant()] = $label
+            }
+            $evidence.modules['Availability groups'] = 'Collected'
+        }
+        catch { $evidence.modules['Availability groups'] = "Failed: $($_.Exception.Message)" }
+    }
+
+    try {
+        $logShipped = Invoke-SqlRead -Instance $Instance -TimeoutSeconds $TimeoutSeconds -Credential $Credential -Query @"
+SELECT primary_database AS DatabaseName FROM msdb.dbo.log_shipping_primary_databases;
+"@
+        foreach ($shipped in $logShipped) {
+            $key = ([string]$shipped.DatabaseName).ToUpperInvariant()
+            if (-not $mechanisms.ContainsKey($key)) { $mechanisms[$key] = 'Log shipping (primary)' }
+        }
+    }
+    catch { }
+
+    try {
+        $mirrored = Invoke-SqlRead -Instance $Instance -TimeoutSeconds $TimeoutSeconds -Credential $Credential -Query @"
+SELECT DB_NAME(database_id) AS DatabaseName, mirroring_state_desc AS MirrorState
+FROM   sys.database_mirroring WHERE mirroring_guid IS NOT NULL;
+"@
+        foreach ($mirror in $mirrored) {
+            $key = ([string]$mirror.DatabaseName).ToUpperInvariant()
+            if (-not $mechanisms.ContainsKey($key)) { $mechanisms[$key] = "Database mirroring ($($mirror.MirrorState))" }
+        }
+    }
+    catch { }
+
+    foreach ($key in @($evidence.databases.Keys)) {
+        $mechanism = ''
+        if ($mechanisms.ContainsKey($key)) { $mechanism = $mechanisms[$key] }
+        elseif ($mechanisms.ContainsKey('*')) { $mechanism = $mechanisms['*'] }
+        elseif ($evidence.databases[$key].Contains('isReplicated') -and $evidence.databases[$key]['isReplicated']) { $mechanism = 'Transactional / merge replication' }
+        else { $mechanism = 'Backup and restore only' }
+        $evidence.databases[$key]['recoveryMechanism'] = $mechanism
+    }
+
+    return $evidence
+}
+
+# =========================================================================================
+# REGION  Simulator
+#
+#   A made-up estate, built in exactly the shapes the workbook reader and the SQL collector
+#   produce, so everything after this point runs as it does for real. It is built to show
+#   every case the scenario run-down can meet: a VM carrying two SQL instances, a
+#   synchronous availability group, a failover cluster, log shipping, measured, derived and
+#   NULL restore times, SIMPLE recovery, a database with no backup, one never integrity
+#   checked, one SUSPECT, a database shared by three applications, an unreachable instance
+#   and one nobody has collected from. Dates are relative to today, so it never goes stale.
+# =========================================================================================
+
+function Get-SimulatedEstate {
+    $now = Get-Date
+    function Get-SimDate {
+        param($Days, [string]$Format = 'yyyy-MM-dd')
+        if ($null -eq $Days) { return $null }
+        $now.AddDays(-$Days).ToString($Format)
+    }
+
+    # Collected instances get a full evidence record; SIMUAT01 fails to connect; SIMDEV01 was
+    # never collected, so everything about it comes from the "workbook" alone.
+    $simInstances = @(
+        @{ Name = 'SIMPRD01\CLAIMS'; Server = 'SIMPRD01'; Version = '13.0.6300.2'; Level = 'SP3'; Clustered = $false; Hadr = $false; Reach = 'Connected';    Status = 'Collected' }
+        @{ Name = 'SIMPRD01\POLICY'; Server = 'SIMPRD01'; Version = '13.0.6300.2'; Level = 'SP3'; Clustered = $false; Hadr = $false; Reach = 'Connected';    Status = 'Collected' }
+        @{ Name = 'SIMPRD02';        Server = 'SIMPRD02'; Version = '15.0.4355.3'; Level = 'RTM'; Clustered = $false; Hadr = $true;  Reach = 'Connected';    Status = 'Collected' }
+        @{ Name = 'SIMPRD03';        Server = 'SIMPRD03'; Version = '16.0.4135.4'; Level = 'RTM'; Clustered = $true;  Hadr = $false; Reach = 'Connected';    Status = 'Collected' }
+        @{ Name = 'SIMUAT01';        Server = 'SIMUAT01'; Version = '2016';        Level = '';    Clustered = $false; Hadr = $false; Reach = 'Disconnected'; Status = 'Unreachable' }
+        @{ Name = 'SIMDEV01';        Server = 'SIMDEV01'; Version = '2019';        Level = '';    Clustered = $false; Hadr = $false; Reach = 'Not tested';   Status = 'Not collected' }
+    )
+
+    function New-SimDb {
+        param([string[]]$Apps, [string]$Instance, [string]$Name, [string]$Env, [double]$Gb, $Compat = $null,
+              [string]$Model = 'FULL', [string]$State = 'ONLINE', $FullDays = 1, $LogHours = 1, $Mbps = $null,
+              $CheckDays = 5, $TimedMinutes = $null, [string]$Mechanism = '', [string]$SheetRestore = '')
+        @{ Apps = $Apps; Instance = $Instance; Name = $Name; Env = $Env; Gb = $Gb; Compat = $Compat; Model = $Model
+           State = $State; FullDays = $FullDays; LogHours = $LogHours; Mbps = $Mbps; CheckDays = $CheckDays
+           TimedMinutes = $TimedMinutes; Mechanism = $Mechanism; SheetRestore = $SheetRestore }
+    }
+    $agSync = "Always On AG 'SIM_AG_PAY' (synchronous)"
+    $simDatabases = @(
+        (New-SimDb -Apps 'Claims Portal' -Instance 'SIMPRD01\CLAIMS' -Name 'ClaimsDB' -Env 'PROD' -Gb 120 -Compat 130 -Mbps 140 -CheckDays 3 -TimedMinutes 95)
+        (New-SimDb -Apps 'Claims Portal' -Instance 'SIMPRD01\CLAIMS' -Name 'ClaimsArchive' -Env 'PROD' -Gb 340 -Compat 110 -Model 'SIMPLE' -FullDays 2 -LogHours $null -Mbps 180 -CheckDays 'Never')
+        (New-SimDb -Apps 'Claims Portal' -Instance 'SIMPRD01\CLAIMS' -Name 'ClaimsDocs' -Env 'PROD' -Gb 55 -Compat 130 -FullDays $null -LogHours $null -CheckDays 20)
+        (New-SimDb -Apps 'Claims Portal', 'Policy Admin', 'Payments Hub' -Instance 'SIMPRD01\CLAIMS' -Name 'RefData' -Env 'PROD' -Gb 8 -Compat 130 -Mbps 90 -CheckDays 6)
+        (New-SimDb -Apps 'Policy Admin' -Instance 'SIMPRD01\POLICY' -Name 'PolicyCore' -Env 'PROD' -Gb 210 -Compat 130 -Mbps 110 -CheckDays 4 -TimedMinutes 240 -Mechanism 'Log shipping (primary)')
+        (New-SimDb -Apps 'Policy Admin' -Instance 'SIMPRD01\POLICY' -Name 'PolicyRating' -Env 'PROD' -Gb 40 -Compat 120 -Mbps 150 -CheckDays 4)
+        (New-SimDb -Apps 'Customer 360' -Instance 'SIMPRD01\POLICY' -Name 'CustMaster' -Env 'PROD' -Gb 95 -Compat 100 -Model 'SIMPLE' -FullDays 4 -LogHours $null -Mbps 120 -CheckDays 30)
+        (New-SimDb -Apps 'Payments Hub' -Instance 'SIMPRD02' -Name 'PaymentsDB' -Env 'PROD' -Gb 60 -Compat 150 -FullDays 0.5 -LogHours 0.25 -Mbps 200 -CheckDays 2 -Mechanism $agSync)
+        (New-SimDb -Apps 'Payments Hub' -Instance 'SIMPRD02' -Name 'PayLedger' -Env 'PROD' -Gb 150 -Compat 150 -FullDays 0.5 -LogHours 0.25 -Mbps 160 -CheckDays 2 -TimedMinutes 110 -Mechanism $agSync)
+        (New-SimDb -Apps 'HR Payroll' -Instance 'SIMPRD02' -Name 'PayrollDB' -Env 'PROD' -Gb 25 -Compat 140 -State 'SUSPECT' -LogHours 3 -Mbps 100 -CheckDays $null)
+        (New-SimDb -Apps 'Customer 360' -Instance 'SIMPRD03' -Name 'CustEvents' -Env 'PROD' -Gb 480 -Compat 160 -Mbps 250 -CheckDays 7)
+        (New-SimDb -Apps 'HR Payroll' -Instance 'SIMPRD03' -Name 'HRCore' -Env 'PROD' -Gb 30 -Compat 160 -Mbps 120 -CheckDays 7)
+        (New-SimDb -Apps 'Claims Portal' -Instance 'SIMUAT01' -Name 'ClaimsDB_UAT' -Env 'UAT' -Gb 60 -SheetRestore '45')
+        (New-SimDb -Apps 'Policy Admin' -Instance 'SIMUAT01' -Name 'PolicyCore_UAT' -Env 'UAT' -Gb 90 -SheetRestore '70')
+        (New-SimDb -Apps 'Claims Portal' -Instance 'SIMDEV01' -Name 'ClaimsDB_DEV' -Env 'DEV' -Gb 12 -SheetRestore '10')
+        (New-SimDb -Apps 'Customer 360' -Instance 'SIMDEV01' -Name 'Cust_DEV' -Env 'DEV' -Gb 6)
+    )
+
+    $prodRows = [System.Collections.Generic.List[object]]::new()
+    $nonProdRows = [System.Collections.Generic.List[object]]::new()
+    $evidence = @{}
+    $connectivity = @{}
+
+    foreach ($i in $simInstances) {
+        $connectivity[$i.Name] = $i.Reach
+        if ($i.Status -eq 'Not collected') { continue }
+        $evidence[$i.Name] = [ordered]@{
+            instance = $i.Name; status = $i.Status; message = ''
+            machine = $i.Server; version = ''; productLevel = ''; edition = ''
+            isClustered = $i.Clustered; isHadrEnabled = $i.Hadr
+            modules = [ordered]@{}; databases = @{}
+        }
+        if ($i.Status -eq 'Unreachable') {
+            $evidence[$i.Name].message = 'Server not found, or not accepting remote connections. Check the name first, then the firewall on TCP 1433.'
+        }
+        else {
+            $evidence[$i.Name].version = $i.Version
+            $evidence[$i.Name].productLevel = $i.Level
+            $evidence[$i.Name].edition = 'Enterprise Edition (64-bit)'
+            $evidence[$i.Name].modules['Simulation'] = 'Simulated'
+        }
+    }
+
+    foreach ($db in $simDatabases) {
+        $instance = $simInstances | Where-Object { $_.Name -eq $db.Instance }
+        foreach ($app in $db.Apps) {
+            $row = [pscustomobject][ordered]@{
+                'application name'                = $app
+                'instance name'                   = $db.Instance
+                'servername'                      = $instance.Server
+                'databasename'                    = $db.Name
+                'environment'                     = $db.Env
+                'database size (gb)'              = [string]$db.Gb
+                'ha/dr method'                    = ''
+                'last restore duration (minutes)' = $db.SheetRestore
+                'sql version'                     = $instance.Version
+            }
+            if ($db.Env -eq 'PROD') { $prodRows.Add($row) } else { $nonProdRows.Add($row) }
+        }
+
+        if ($instance.Status -ne 'Collected') { continue }
+        $mechanism = $(if ($db.Mechanism) { $db.Mechanism } elseif ($instance.Clustered) { 'Failover Cluster Instance' } else { 'Backup and restore only' })
+        $fact = [ordered]@{
+            name = $db.Name; sizeGb = $db.Gb; compatibility = $db.Compat; recoveryModel = $db.Model; state = $db.State
+            isReplicated = $false; recoveryMechanism = $mechanism
+            lastFullBackup = Get-SimDate $db.FullDays
+            lastLogBackup = $(if ($null -ne $db.LogHours) { Get-SimDate ($db.LogHours / 24) 'yyyy-MM-dd HH:mm' } else { $null })
+            backupThroughputMBs = $(if ($null -ne $db.FullDays -and $null -ne $db.Mbps) { [double]$db.Mbps } else { $null })
+            backupMinutes = $(if ($null -ne $db.FullDays -and $null -ne $db.Mbps) { [math]::Round($db.Gb * 1024 / $db.Mbps / 60, 1) } else { $null })
+            lastGoodCheckDb = $(if ('Never' -eq $db.CheckDays) { 'Never' } else { Get-SimDate $db.CheckDays })
+            lastRestore = $(if ($null -ne $db.TimedMinutes) { Get-SimDate 30 } else { $null })
+        }
+        if ($null -ne $db.TimedMinutes) {
+            $fact.timedRestoreMinutes = [double]$db.TimedMinutes
+            $fact.timedRestoreSamples = 2
+            $fact.timedRestoreSource = 'CommandLog in [DBA] (simulated)'
+        }
+        $evidence[$db.Instance].databases[$db.Name.ToUpperInvariant()] = $fact
+    }
+
+    $details = @(
+        [ordered]@{ application = 'Claims Portal'; sheet = 'App_Details (simulated)'; fields = @(
+            [ordered]@{ label = 'Business owner'; value = 'Claims Operations'; isNull = $false }
+            [ordered]@{ label = 'Criticality'; value = 'Tier 1'; isNull = $false }
+            [ordered]@{ label = 'RTO agreed'; value = 'NULL'; isNull = $true }) }
+        [ordered]@{ application = 'Payments Hub'; sheet = 'App_Details (simulated)'; fields = @(
+            [ordered]@{ label = 'Business owner'; value = 'Treasury'; isNull = $false }
+            [ordered]@{ label = 'Criticality'; value = 'Tier 1'; isNull = $false }
+            [ordered]@{ label = 'RTO agreed'; value = '4 hours'; isNull = $false }) }
+    )
+
+    [pscustomobject]@{
+        ProdRows = $prodRows.ToArray(); NonProdRows = $nonProdRows.ToArray()
+        Details = $details; Evidence = $evidence; Connectivity = $connectivity
+    }
+}
+
+# =========================================================================================
+# REGION  Read the workbook
+# =========================================================================================
+
+if ($Simulate) {
+    Write-Host 'SIMULATION: building the report from a made-up estate. No workbook is read and no server is contacted.' -ForegroundColor Yellow
+    if ($CollectSqlEvidence -or $TestConnectivity) {
+        Write-Host '  -CollectSqlEvidence and -TestConnectivity are ignored in a simulation.' -ForegroundColor Yellow
+    }
+    $simulation = Get-SimulatedEstate
+    $prodRows = $simulation.ProdRows
+    $nonProdRows = $simulation.NonProdRows
+    [object[]]$applicationDetails = @($simulation.Details)
+    if ([string]::IsNullOrWhiteSpace($OutputHtml)) {
+        $OutputHtml = Join-Path (Get-Location).Path 'SQL_Resilience_MTTR_SIMULATED.html'
+    }
+}
+else {
+    if ([string]::IsNullOrWhiteSpace($SourceWorkbook)) { $SourceWorkbook = Select-ExcelWorkbook }
+    if (-not (Test-Path -LiteralPath $SourceWorkbook)) { throw "Source workbook not found: $SourceWorkbook" }
+    $SourceWorkbook = (Resolve-Path -LiteralPath $SourceWorkbook).Path
+    if ([string]::IsNullOrWhiteSpace($OutputHtml)) {
+        $OutputHtml = Join-Path (Split-Path -Parent $SourceWorkbook) 'SQL_Resilience_MTTR_Framework.html'
+    }
+
+    Write-Host 'Reading workbook...' -ForegroundColor Cyan
+    $excel = $null
+    $workbook = $null
+    try {
+        try { $excel = New-Object -ComObject Excel.Application }
+        catch { throw 'Microsoft Excel is required to read the workbook and is not available on this machine.' }
+        $excel.Visible = $false
+        $excel.DisplayAlerts = $false
+        $workbook = $excel.Workbooks.Open($SourceWorkbook, $null, $true)
+        $prodRows = Read-ExcelWorksheet -Workbook $workbook -WorksheetName 'Prod_DBInventory'
+        $nonProdRows = Read-ExcelWorksheet -Workbook $workbook -WorksheetName 'NonProd_Inventory'
+        [object[]]$applicationDetails = @(Read-ApplicationDetails -Workbook $workbook -RequestedWorksheet $DetailsWorksheet)
+    }
+    finally {
+        if ($null -ne $workbook) { $workbook.Close($false) | Out-Null }
+        if ($null -ne $excel) { $excel.Quit() }
+        if ($null -ne $workbook) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($workbook) }
+        if ($null -ne $excel) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($excel) }
+        [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+    }
+}
+
+# A relative -OutputHtml is taken relative to where the command was run, not to wherever
+# .NET happens to think the current directory is.
+if (-not [IO.Path]::IsPathRooted($OutputHtml)) { $OutputHtml = Join-Path (Get-Location).Path $OutputHtml }
+
+$inventory = [System.Collections.Generic.List[object]]::new()
+function Add-InventoryRows {
+    param(
+        [Parameter(Mandatory)][object[]]$Rows,
+        [Parameter(Mandatory)][string]$DefaultEnvironment
+    )
+    foreach ($row in $Rows) {
+        $application = Get-FieldValue $row @('application name', 'application', 'app name', 'appname')
+        $instance = Get-FieldValue $row @('instance name', 'servername')
+        $server = Get-FieldValue $row @('servername')
+        $database = Get-FieldValue $row @('databasename', 'database name')
+        $environment = Get-FieldValue $row @('environment')
+        if (-not $environment) { $environment = $DefaultEnvironment }
+        if (-not $server) { $server = (Get-HostAndPort $instance).Host }
+
+        # Hand-captured values from the workbook. These fill gaps the SQL collection leaves,
+        # and are overridden by anything actually measured on the instance.
+        $sheetSize = Get-FieldValue $row @('database size', 'database size (gb)', 'size gb', 'size (gb)', 'size')
+        $sheetCompat = Get-FieldValue $row @('compatibility level', 'compatibility')
+        $sheetMechanism = Get-FieldValue $row @('ha/dr method', 'hadr method', 'dr method', 'data replication method', 'replication method')
+        $sheetRestore = Get-FieldValue $row @('last restore duration (minutes)', 'restore duration (minutes)', 'measured restore minutes')
+        $sheetVersion = Get-FieldValue $row @('sql version', 'sql server version', 'version')
+
+        $inventory.Add([pscustomobject]@{
+            Application     = $(if ($application) { $application } else { 'Unattributed' })
+            Environment     = $(if ($environment) { $environment.ToUpperInvariant() } else { 'UNKNOWN' })
+            Server          = $(if ($server) { $server } else { '' })
+            Instance        = $(if ($instance) { $instance } else { '' })
+            Database        = $(if ($database) { $database } else { '' })
+            SheetSize       = $sheetSize
+            SheetCompat     = $sheetCompat
+            SheetMechanism  = $sheetMechanism
+            SheetRestore    = $sheetRestore
+            SheetVersion    = $sheetVersion
+        })
+    }
+}
+Add-InventoryRows -Rows @($prodRows) -DefaultEnvironment 'PROD'
+Add-InventoryRows -Rows @($nonProdRows) -DefaultEnvironment 'NONPROD'
+
+$inventory = @($inventory | Sort-Object Application, Instance, Database, Environment)
+if ($inventory.Count -eq 0) { throw 'No inventory records were found in the source workbook.' }
+
+$instanceNames = @($inventory.Instance | Where-Object { $_ } | Sort-Object -Unique)
+
+# A version typed into the workbook is better than no version at all. Anything collected
+# from the instance itself overrides it.
+$sheetVersionByInstance = @{}
+foreach ($row in $inventory) {
+    if ($row.Instance -and $row.SheetVersion -and -not $sheetVersionByInstance.ContainsKey($row.Instance)) {
+        $sheetVersionByInstance[$row.Instance] = $row.SheetVersion
+    }
+}
+
+# =========================================================================================
+# REGION  Connectivity and evidence
+# =========================================================================================
+
+$statusByInstance = @{}
+foreach ($instanceName in $instanceNames) {
+    if ($Simulate) { $statusByInstance[$instanceName] = $simulation.Connectivity[$instanceName] }
+    elseif ($TestConnectivity) {
+        $endpoint = Get-HostAndPort $instanceName
+        $statusByInstance[$instanceName] = Test-TcpEndpoint -HostName $endpoint.Host -Port $endpoint.Port -TimeoutMs $ConnectivityTimeoutMs
+    }
+    else { $statusByInstance[$instanceName] = 'Not tested' }
+}
+
+$evidenceByInstance = @{}
+if ($Simulate) { $evidenceByInstance = $simulation.Evidence }
+elseif ($CollectSqlEvidence) {
+    Write-Host ("Collecting read-only evidence from {0} SQL instance(s)..." -f $instanceNames.Count) -ForegroundColor Cyan
+    $index = 0
+    foreach ($instanceName in $instanceNames) {
+        $index++
+        Write-Progress -Activity 'Collecting SQL evidence' -Status $instanceName -PercentComplete (($index / [math]::Max(1, $instanceNames.Count)) * 100)
+        $evidence = Get-SqlInstanceEvidence -Instance $instanceName -TimeoutSeconds $SqlTimeoutSeconds -Credential $SqlCredential -WindowDays $EvidenceWindowDays -CommandLogDatabase $CommandLogDatabase
+        $evidenceByInstance[$instanceName] = $evidence
+        $colour = $(if ($evidence.status -eq 'Collected') { 'Green' } else { 'Yellow' })
+        Write-Host ("  [{0,3}/{1}] {2,-40} {3}" -f $index, $instanceNames.Count, $instanceName, $evidence.status) -ForegroundColor $colour
+    }
+    Write-Progress -Activity 'Collecting SQL evidence' -Completed
+}
+
+# =========================================================================================
+# REGION  Build the payload
+# =========================================================================================
+
+function Get-DatabaseEvidence {
+    param([string]$Instance, [string]$Database)
+    if (-not $evidenceByInstance.ContainsKey($Instance)) { return $null }
+    $store = $evidenceByInstance[$Instance].databases
+    $key = $Database.ToUpperInvariant()
+    if ($store.ContainsKey($key)) { return $store[$key] }
+    return $null
+}
+
+function Get-EvidenceValue {
+    param($Store, [string]$Key)
+    if ($null -eq $Store) { return $null }
+    if ($Store.Contains($Key)) { return $Store[$Key] }
+    return $null
+}
+
+$data = @($inventory | ForEach-Object {
+    $row = $_
+    $connectivity = $(if ($row.Instance) { $statusByInstance[$row.Instance] } else { 'Unknown' })
+    $dbEvidence = Get-DatabaseEvidence -Instance $row.Instance -Database $row.Database
+
+    # Size: measured wins, then hand-captured, then nothing at all.
+    $sizeGb = Get-EvidenceValue $dbEvidence 'sizeGb'
+    if ($null -eq $sizeGb) {
+        $parsed = 0.0
+        if ($row.SheetSize -and [double]::TryParse(($row.SheetSize -replace '[^0-9\.]', ''), [ref]$parsed) -and $parsed -gt 0) { $sizeGb = $parsed }
+        else { $sizeGb = $null }
+    }
+
+    $compatibility = Get-EvidenceValue $dbEvidence 'compatibility'
+    if ($null -eq $compatibility) {
+        $parsedCompat = 0
+        if ($row.SheetCompat -and [int]::TryParse(($row.SheetCompat -replace '[^0-9]', ''), [ref]$parsedCompat) -and $parsedCompat -gt 0) { $compatibility = $parsedCompat }
+        else { $compatibility = $null }
+    }
+
+    $mechanism = Get-EvidenceValue $dbEvidence 'recoveryMechanism'
+    if (-not $mechanism) {
+        if ($row.SheetMechanism) { $mechanism = $row.SheetMechanism } else { $mechanism = $null }
+    }
+
+    $timedRestore = Get-EvidenceValue $dbEvidence 'timedRestoreMinutes'
+    $timedSource = Get-EvidenceValue $dbEvidence 'timedRestoreSource'
+    if ($null -eq $timedRestore -and $row.SheetRestore) {
+        $parsedRestore = 0.0
+        if ([double]::TryParse(($row.SheetRestore -replace '[^0-9\.]', ''), [ref]$parsedRestore) -and $parsedRestore -gt 0) {
+            $timedRestore = $parsedRestore
+            $timedSource = 'Recorded in the workbook'
+        }
+    }
+
+    [ordered]@{
+        application         = $row.Application
+        environment         = $row.Environment
+        server              = $row.Server
+        instance            = $row.Instance
+        database            = $row.Database
+        connectivity        = $connectivity
+        sizeGb              = $sizeGb
+        compatibility       = $compatibility
+        recoveryModel       = Get-EvidenceValue $dbEvidence 'recoveryModel'
+        state               = Get-EvidenceValue $dbEvidence 'state'
+        mechanism           = $mechanism
+        backupThroughputMBs = Get-EvidenceValue $dbEvidence 'backupThroughputMBs'
+        backupMinutes       = Get-EvidenceValue $dbEvidence 'backupMinutes'
+        lastFullBackup      = Get-EvidenceValue $dbEvidence 'lastFullBackup'
+        lastLogBackup       = Get-EvidenceValue $dbEvidence 'lastLogBackup'
+        lastGoodCheckDb     = Get-EvidenceValue $dbEvidence 'lastGoodCheckDb'
+        lastRestore         = Get-EvidenceValue $dbEvidence 'lastRestore'
+        timedRestoreMinutes = $timedRestore
+        timedRestoreSamples = Get-EvidenceValue $dbEvidence 'timedRestoreSamples'
+        timedRestoreSource  = $timedSource
+    }
+})
+
+$instanceMeta = @($instanceNames | ForEach-Object {
+    $name = $_
+    $evidence = $(if ($evidenceByInstance.ContainsKey($name)) { $evidenceByInstance[$name] } else { $null })
+    $version = $(if ($evidence -and $evidence.version) { $evidence.version }
+                 elseif ($sheetVersionByInstance.ContainsKey($name)) { $sheetVersionByInstance[$name] }
+                 else { '' })
+    [ordered]@{
+        instance      = $name
+        status        = $(if ($evidence) { $evidence.status } else { 'Not collected' })
+        message       = $(if ($evidence) { $evidence.message } else { '' })
+        version       = $version
+        versionSource = $(if ($evidence -and $evidence.version) { 'measured' }
+                          elseif ($sheetVersionByInstance.ContainsKey($name)) { 'workbook' }
+                          else { 'none' })
+        productLevel  = $(if ($evidence) { $evidence.productLevel } else { '' })
+        edition       = $(if ($evidence) { $evidence.edition } else { '' })
+        connectivity  = $statusByInstance[$name]
+    }
+})
+
+$json = ($data | ConvertTo-Json -Depth 8 -Compress) -replace '</', '<\/'
+$detailsJson = ConvertTo-Json -InputObject $applicationDetails -Depth 8 -Compress
+if (-not $detailsJson) { $detailsJson = '[]' }
+$detailsJson = $detailsJson -replace '</', '<\/'
+$instanceJson = ConvertTo-Json -InputObject $instanceMeta -Depth 8 -Compress
+if (-not $instanceJson) { $instanceJson = '[]' }
+$instanceJson = $instanceJson -replace '</', '<\/'
+
+$generated = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss K')
+$sourceName = $(if ($Simulate) { 'SIMULATED estate (built in, made up)' } else { [IO.Path]::GetFileName($SourceWorkbook) })
+$connectivityCaption = $(if ($Simulate) { 'Simulated' } elseif ($TestConnectivity) { 'TCP endpoint test performed' } else { 'Not tested' })
+$collectionCaption = $(if ($Simulate) { 'SIMULATED - no server was contacted' }
+                       elseif ($CollectSqlEvidence) { "SQL evidence collected, $EvidenceWindowDays day window" }
+                       else { 'SQL evidence not collected (run with -CollectSqlEvidence)' })
+
+# Navy carries structure, green carries interaction and health. Green is deliberately not a
+# large background fill: it would fight every red and amber status marker on the page, and
+# those markers are the point.
+$palettes = @{
+    Manulife = @{
+        Brand = '#34384B'; BrandDark = '#23263A'; BrandSoft = '#EEF0F4'
+        Accent = '#00A758'; AccentDark = '#00875D'; AccentSoft = '#E6F6EE'
+    }
+    Slate = @{
+        Brand = '#2F3640'; BrandDark = '#1F242C'; BrandSoft = '#EDEFF2'
+        Accent = '#4A7C9B'; AccentDark = '#3A6480'; AccentSoft = '#E9F1F6'
+    }
+}
+$theme = $palettes[$Palette]
+
+$html = @'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SQL Application View</title>
+<style>
+:root{
+  --brand:__T_BRAND__;--brand-dark:__T_BRAND_DARK__;--brand-soft:__T_BRAND_SOFT__;
+  --accent:__T_ACCENT__;--accent-dark:__T_ACCENT_DARK__;--accent-soft:__T_ACCENT_SOFT__;
+  --bg:#F4F6F8;--panel:#fff;--ink:#1F2333;--ink2:#4A5265;--ink3:#7B8397;
+  --line:#DCE1E8;--line2:#EDF0F4;
+  --crit:#C6093B;--crit-bg:#FDECEF;--high:#D9660A;--high-bg:#FFF3E6;
+  --med:#8A6A00;--med-bg:#FFF8E1;--good:#00875D;--good-bg:#E6F6EE;
+  --info:#0067B9;--info-bg:#E8F1FA;
+  --shadow:0 8px 24px rgba(31,35,51,.10);
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{font-family:"Segoe UI",Arial,sans-serif;background:var(--bg);color:var(--ink);font-size:13px;overflow:hidden}
+.shell{height:100vh;display:grid;grid-template-rows:auto auto 1fr auto}
+
+/* ---- header ---- */
+.top{background:linear-gradient(105deg,var(--brand-dark),var(--brand));color:#fff;padding:14px 24px;display:flex;justify-content:space-between;align-items:center;gap:20px;border-bottom:3px solid var(--accent)}
+.top h1{margin:0;font-size:19px;font-weight:650;letter-spacing:.2px}
+.top p{margin:4px 0 0;color:#C9CEDA;font-size:11px}
+.top-stats{display:flex;gap:9px}
+.top-stat{min-width:104px;text-align:center;background:#ffffff14;border:1px solid #ffffff2e;border-radius:7px;padding:8px 12px}
+.top-stat b{display:block;font-size:19px;line-height:1.1}
+.top-stat span{display:block;color:#C9CEDA;font-size:9px;text-transform:uppercase;letter-spacing:.5px;margin-top:2px}
+
+/* ---- nav ---- */
+.nav-tabs{display:flex;align-items:center;gap:7px;padding:9px 18px;background:#fff;border-bottom:1px solid var(--line)}
+.nav-tab{border:1px solid var(--line);background:#fff;color:var(--ink2);border-radius:7px;padding:9px 15px;font:inherit;font-weight:650;cursor:pointer;transition:.12s;display:inline-flex;align-items:center;gap:7px}
+.nav-tab:hover{border-color:var(--accent);color:var(--brand)}
+.nav-tab.active{background:var(--brand);color:#fff;border-color:var(--brand)}
+.wip{font-size:8.5px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;padding:2px 6px;border-radius:999px;background:var(--med-bg);color:var(--med);border:1px solid #E6D4A0}
+.view-panel{min-height:0;overflow:auto;padding:16px}
+.view-panel.hidden{display:none!important}
+.wrap{max-width:1620px;margin:0 auto}
+
+/* ---- surfaces ---- */
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow)}
+.pad{padding:18px}
+h2.sec{margin:0 0 4px;color:var(--brand);font-size:19px}
+h3.sec{margin:22px 0 10px;color:var(--brand);font-size:14px;text-transform:uppercase;letter-spacing:.5px;padding-bottom:7px;border-bottom:2px solid var(--line)}
+p.lead{margin:0 0 16px;color:var(--ink2);line-height:1.6;max-width:1080px}
+.note{font-size:11px;color:var(--ink3);line-height:1.55}
+.grid2{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+
+/* ---- cards / KPIs ---- */
+.kpi{background:#fff;border:1px solid var(--line);border-top:4px solid var(--accent-c,var(--accent));border-radius:9px;padding:13px 15px}
+.kpi b{display:block;color:var(--brand);font-size:26px;line-height:1.05}
+.kpi .sub{display:block;margin-top:5px;color:var(--ink3);font-size:10px}
+.kpi span.lbl{display:block;margin-top:6px;color:var(--ink2);font-size:10px;font-weight:650;text-transform:uppercase;letter-spacing:.4px}
+.card{border:1px solid var(--line);border-top:4px solid var(--accent-c,var(--accent));border-radius:9px;padding:14px;background:#fff}
+.card b.h{display:block;color:var(--brand);font-size:12.5px;margin-bottom:7px}
+.card p{color:var(--ink2);font-size:11px;line-height:1.6;margin:0}
+.formula{display:block;margin:9px 0 0;padding:9px 11px;border-radius:6px;background:var(--brand);color:#fff;font-size:10.5px;font-weight:650;line-height:1.5}
+.callout{margin-top:14px;padding:13px 15px;border:1px solid var(--line);border-left:5px solid var(--accent);border-radius:8px;background:var(--accent-soft);color:#12402C;font-size:11.5px;line-height:1.6}
+.callout.warn{border-left-color:var(--med);background:var(--med-bg);color:#5C4700}
+
+/* ---- environment spread: a count per environment, never a row of markers ---- */
+.spread{display:inline-flex;flex-wrap:wrap;gap:10px;align-items:center}
+.spread .ec{display:inline-flex;align-items:center;gap:5px;font-size:9.5px;font-weight:700;letter-spacing:.2px;white-space:nowrap}
+.spread .ec:before{content:"";width:9px;height:9px;border-radius:2px;background:var(--env-c,var(--ink3))}
+
+/* ---- badges ---- */
+.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border-radius:999px;font-size:9.5px;font-weight:700;white-space:nowrap;border:1px solid transparent}
+.badge:before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.b-measured{color:var(--good);background:var(--good-bg);border-color:#A8DCC5}
+.b-derived{color:var(--info);background:var(--info-bg);border-color:#B5D2EC}
+.b-none{color:var(--ink3);background:var(--line2);border-color:var(--line)}
+.b-crit{color:var(--crit);background:var(--crit-bg);border-color:#EFBCC7}
+.env{display:inline-block;padding:3px 8px;border-radius:4px;color:#fff;font-size:9px;font-weight:700;letter-spacing:.4px}
+.env-PROD,.env-PRD,.env-PRODUCTION{background:#C6093B}
+.env-DR{background:#6B4BA3}
+.env-UAT{background:#D9660A}
+.env-SIT,.env-QA,.env-TEST{background:#0F6FA8}
+.env-DEV{background:#00875D}
+.env-SANDBOX{background:#00695C}
+.env-NONPROD,.env-UNKNOWN{background:#7B8397}
+.status{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border-radius:999px;font-size:9.5px;font-weight:650;border:1px solid transparent}
+.status:before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.Connected{color:var(--good);background:var(--good-bg);border-color:#A8DCC5}
+.Disconnected{color:var(--crit);background:var(--crit-bg);border-color:#EFBCC7}
+.Not-tested,.Unknown,.Not-collected{color:var(--ink3);background:var(--line2);border-color:var(--line)}
+.nul{color:var(--ink3);font-weight:700;font-size:.92em;letter-spacing:.6px}
+
+/* ---- tables ---- */
+.table{width:100%;border-collapse:collapse;font-size:11px}
+.table th{position:sticky;top:0;background:var(--brand);color:#fff;text-align:left;padding:9px 10px;font-weight:650;z-index:1;white-space:nowrap}
+.table td{padding:8px 10px;border-bottom:1px solid var(--line2);vertical-align:top;overflow-wrap:anywhere}
+.table tbody tr:hover td{background:var(--brand-soft)}
+.table td.num,.table th.num{text-align:right;white-space:nowrap}
+.tbl-wrap{overflow:auto;border:1px solid var(--line);border-radius:9px;background:#fff}
+.mono{font-variant-numeric:tabular-nums}
+
+/* =========================================================================
+   APPLICATION RELATIONSHIP MAP
+   The application sits at the top, one card per environment below it, the SQL
+   instances inside each card, and the databases under each instance. The
+   instance name is the thing being emphasised - it is what gets rebuilt.
+   ========================================================================= */
+.topo{padding:20px 18px 18px}
+.flow-root{display:flex;justify-content:center}
+.root-circle{width:158px;height:158px;border-radius:50%;background:linear-gradient(135deg,var(--brand-dark),var(--brand));color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:16px;border:5px solid var(--brand-soft);box-shadow:0 10px 26px rgba(31,35,51,.22)}
+.root-circle b{font-size:13.5px;font-weight:700;line-height:1.25;overflow-wrap:anywhere}
+.root-circle span{display:block;font-size:9.5px;color:#C9CEDA;margin-top:6px;line-height:1.4}
+.pointer-line{width:2px;height:32px;background:var(--line);margin:0 auto;position:relative}
+.pointer-line:after{content:"";position:absolute;bottom:-1px;left:-4px;border-left:5px solid transparent;border-right:5px solid transparent;border-top:8px solid var(--line)}
+.env-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:13px;margin-top:12px}
+.env-card{border:1px solid var(--line);border-top:5px solid var(--env-c,var(--ink3));border-radius:10px;background:#fff;padding:15px;box-shadow:0 2px 10px rgba(31,35,51,.05)}
+.env-card .eh{display:flex;align-items:center;gap:13px}
+.env-circle{width:64px;height:64px;flex:0 0 64px;border-radius:50%;background:var(--env-c,var(--ink3));color:#fff;display:flex;align-items:center;justify-content:center;text-align:center;font-size:9.5px;font-weight:800;letter-spacing:.3px;line-height:1.15;padding:5px;word-break:break-word;box-shadow:0 0 0 3px #fff,0 0 0 5px var(--env-c,var(--ink3))}
+.env-sum b{display:block;font-size:13.5px;color:var(--brand)}
+.env-sum span{display:block;font-size:10.5px;color:var(--ink3);margin-top:3px;line-height:1.45}
+.inst-stack{margin:14px 0 0 32px;padding-left:22px;border-left:2px solid var(--line)}
+.inst-node{position:relative;padding:10px 0}
+.inst-node:before{content:"";position:absolute;left:-22px;top:17px;width:22px;height:2px;background:var(--line)}
+.inst-node:after{content:"";position:absolute;left:-28px;top:12px;width:12px;height:12px;border-radius:50%;background:#fff;border:2.5px solid var(--env-c,var(--ink3))}
+.inst-top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}
+.inst-link{font-size:12.5px;font-weight:700;color:var(--brand);cursor:pointer;background:none;border:0;font-family:inherit;padding:0;text-decoration:underline dotted;text-underline-offset:3px;overflow-wrap:anywhere;text-align:left}
+.inst-link:hover{color:var(--accent-dark)}
+.inst-meta{font-size:9.5px;color:var(--ink3);margin-top:3px;line-height:1.45}
+.inst-fig{font-size:9.5px;color:var(--ink3);white-space:nowrap;text-align:right}
+.inst-fig b{color:var(--brand);font-size:12.5px;font-variant-numeric:tabular-nums}
+.dbchips{display:flex;flex-wrap:wrap;gap:6px;margin-top:9px}
+.dbchip{display:inline-flex;align-items:baseline;gap:7px;border:1px solid var(--line);border-left:4px solid var(--basis-c,var(--ink3));border-radius:6px;background:#FBFCFE;padding:5px 9px}
+.dbchip b{font-size:10.5px;font-weight:650;color:var(--ink)}
+.dbchip span{font-size:9px;color:var(--ink3);font-variant-numeric:tabular-nums;white-space:nowrap}
+.map-legend{display:flex;gap:14px;flex-wrap:wrap;align-items:center;padding:10px 18px;border-top:1px solid var(--line2);font-size:10.5px;color:var(--ink2)}
+.map-legend span{display:inline-flex;align-items:center;gap:6px}
+.map-legend i.sw{width:11px;height:11px;border-radius:3px;display:inline-block}
+.map-legend i.rd{width:11px;height:11px;border-radius:50%;display:inline-block}
+
+/* ---- application panel ---- */
+.app-layout{display:grid;grid-template-columns:300px minmax(0,1fr);gap:14px;align-items:start}
+.app-side{position:sticky;top:0}
+.search{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:7px;font:inherit;outline:none}
+.search:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.app-list{max-height:calc(100vh - 260px);overflow:auto;padding:10px;display:grid;gap:6px}
+.app-btn{width:100%;text-align:left;border:1px solid var(--line);border-left:4px solid var(--accent);background:#fff;border-radius:7px;padding:10px 11px;cursor:pointer;font:inherit;transition:.12s}
+.app-btn:hover{background:var(--brand-soft)}
+.app-btn.active{background:var(--brand);color:#fff;border-color:var(--brand);border-left-color:var(--accent)}
+.app-btn b{display:block;font-size:11.5px;font-weight:650}
+.app-btn span.s{display:block;font-size:9.5px;color:var(--ink3);margin-top:2px}
+.app-btn.active span.s{color:#C9CEDA}
+.app-btn .spread{margin-top:5px;color:var(--ink2)}
+.app-btn.active .spread{color:#E4E8F0}
+.env-block{border:1px solid var(--line);border-radius:9px;margin-bottom:12px;overflow:hidden;background:#fff}
+.env-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 14px;background:var(--brand-soft);border-bottom:1px solid var(--line);flex-wrap:wrap}
+.env-head .l{display:flex;align-items:center;gap:10px}
+.env-head .figs{display:flex;gap:16px;font-size:10.5px;color:var(--ink2)}
+.env-head .figs b{display:block;color:var(--brand);font-size:15px}
+details.inst{border-top:1px solid var(--line2)}
+details.inst summary{list-style:none;cursor:pointer;padding:11px 14px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+details.inst summary::-webkit-details-marker{display:none}
+details.inst summary:hover{background:var(--brand-soft)}
+details.inst summary:before{content:"\25B8";color:var(--accent);font-weight:700;margin-right:8px;display:inline-block;transition:.15s}
+details.inst[open] summary:before{transform:rotate(90deg)}
+.inst-name{font-weight:650;font-size:11.5px;color:var(--brand)}
+.inst-sub{font-size:9.5px;color:var(--ink3);margin-top:3px}
+.inst-figs{display:flex;gap:18px;align-items:flex-end;font-size:9.5px;color:var(--ink3);margin-left:auto}
+.inst-figs>span{display:inline-flex;flex-direction:column;align-items:flex-end;line-height:1.25}
+.inst-figs b{display:block;color:var(--brand);font-size:13px}
+.inst-body{padding:0 14px 14px}
+.link{color:var(--accent-dark);font-weight:650;cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px;background:none;border:0;font:inherit;padding:0}
+
+/* ---- assumptions ---- */
+.assume{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.assume label{font-size:9.5px;color:var(--ink2);font-weight:700;text-transform:uppercase;letter-spacing:.3px}
+.assume input{width:100%;display:block;margin-top:5px;padding:8px 9px;border:1px solid var(--line);border-radius:6px;font:inherit}
+.assume input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.assume .hint{display:block;margin-top:4px;font-size:9px;color:var(--ink3);font-weight:400;text-transform:none;letter-spacing:0}
+.btn{border:0;border-radius:7px;background:var(--accent);color:#fff;padding:10px 16px;font:inherit;font-weight:700;cursor:pointer}
+.btn:hover{background:var(--accent-dark)}
+.btn.sec{background:#fff;color:var(--ink2);border:1px solid var(--line)}
+.saved{color:var(--accent-dark);font-size:10.5px;font-weight:700}
+
+/* ---- server panel ---- */
+.srv-layout{display:grid;grid-template-columns:320px minmax(0,1fr);gap:14px;align-items:start}
+.srv-list{max-height:calc(100vh - 260px);overflow:auto;padding:10px;display:grid;gap:6px}
+.srv-btn{width:100%;text-align:left;border:1px solid var(--line);border-left:4px solid var(--brand);background:#fff;border-radius:7px;padding:10px 11px;cursor:pointer;font:inherit}
+.srv-btn:hover{background:var(--brand-soft)}
+.srv-btn.active{background:var(--brand);color:#fff}
+.srv-btn b{display:block;font-size:11px}
+.srv-btn span.s{display:block;font-size:9.5px;color:var(--ink3);margin-top:3px;line-height:1.45}
+.srv-btn.active span.s{color:#C9CEDA}
+.meta{display:grid;grid-template-columns:repeat(4,1fr);gap:9px;margin:12px 0}
+.meta-box{border:1px solid var(--line);background:var(--brand-soft);border-radius:7px;padding:9px 11px}
+.meta-box b{display:block;font-size:8.5px;color:var(--ink3);text-transform:uppercase;letter-spacing:.4px}
+.meta-box>span{display:block;font-size:11px;margin-top:3px;overflow-wrap:anywhere}
+.empty{display:grid;place-items:center;color:var(--ink3);text-align:center;padding:50px 20px;font-size:12px}
+
+/* ---- exec deck ---- */
+.deck-hero{border-radius:11px;background:linear-gradient(105deg,var(--brand-dark),var(--brand));color:#fff;padding:22px 24px;margin-bottom:14px}
+.deck-hero h2{margin:0;font-size:23px}
+.deck-hero p{margin:9px 0 0;color:#C9CEDA;font-size:12.5px;line-height:1.65;max-width:1000px}
+.scenario{border:1px solid var(--line);border-radius:9px;background:#fff;overflow:hidden}
+.scenario .sh{padding:10px 14px;background:var(--brand);color:#fff;font-size:11px;font-weight:700;letter-spacing:.3px}
+.scenario .sb{padding:14px}
+.scenario .big{font-size:29px;font-weight:700;color:var(--brand);line-height:1.05}
+.scenario .who{font-size:10.5px;color:var(--ink2);margin-top:6px;line-height:1.5}
+
+/* =========================================================================
+   SCENARIO RUN-DOWN
+   Pick a failure, pick what it hits, and walk the recovery one step at a time.
+   ========================================================================= */
+.scn-bar{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap}
+.scn-bar label{display:flex;flex-direction:column;gap:5px;font-size:9.5px;color:var(--ink2);font-weight:700;text-transform:uppercase;letter-spacing:.3px}
+.scn-bar select{min-width:330px;font-weight:650;color:var(--brand)}
+.scn-what{flex:1 1 320px;font-size:11px;color:var(--ink2);line-height:1.55;padding-bottom:9px}
+.scn-picker{margin-top:12px;border:1px solid var(--line);border-radius:8px;background:#FBFCFE}
+.scn-picker .ph{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid var(--line2);font-size:10.5px;color:var(--ink2)}
+.scn-picker .ph .acts{display:flex;gap:12px}
+.scn-picker .pb{max-height:196px;overflow:auto;padding:4px 12px 10px}
+.scn-group{font-size:10px;font-weight:700;color:var(--brand);margin:9px 0 3px;display:flex;align-items:center;gap:7px}
+.scn-opt{display:grid;grid-template-columns:auto minmax(0,1fr) 70px 64px;gap:10px;align-items:center;padding:4px 0;font-size:11px;cursor:pointer;border-bottom:1px dashed var(--line2)}
+.scn-opt input{accent-color:var(--accent);width:15px;height:15px;margin:0}
+.scn-opt .f{font-size:9.5px;color:var(--ink3);font-variant-numeric:tabular-nums;white-space:nowrap;text-align:right}
+.shared-tag{font-size:9px;color:var(--high);font-weight:700;margin-left:6px;white-space:nowrap}
+.scn-story{margin:14px 0;padding:12px 15px;border-radius:8px;background:var(--brand-soft);border-left:5px solid var(--scn-c,var(--brand));font-size:12px;line-height:1.65;color:var(--ink)}
+.scn-h{margin:18px 0 8px;color:var(--brand);font-size:12px;text-transform:uppercase;letter-spacing:.4px}
+.scn-steps td{vertical-align:middle}
+.scn-steps tr.leg td{background:var(--brand-soft);color:var(--brand);font-weight:650;font-size:10.5px;padding:7px 10px}
+.scn-steps tr.leg:hover td{background:var(--brand-soft)}
+.scn-steps td.clock{white-space:nowrap;color:var(--ink2);text-align:right;font-variant-numeric:tabular-nums}
+.step-kind{display:inline-block;min-width:78px;text-align:center;font-size:8.5px;font-weight:800;letter-spacing:.4px;text-transform:uppercase;padding:3px 6px;border-radius:4px;color:#fff;background:var(--k-c,var(--ink3));margin-right:7px}
+.track{position:relative;height:12px;min-width:170px;background:var(--line2);border-radius:3px;overflow:hidden}
+.track i{position:absolute;top:0;bottom:0;border-radius:2px;background:var(--k-c,var(--ink3));min-width:2px}
+.track i.nullbar{width:12px;background:repeating-linear-gradient(45deg,#fff 0 2px,var(--ink3) 2px 4px);opacity:.7}
+.b-assume{color:var(--high);background:var(--high-bg);border-color:#F3C99C}
+.verdict{display:block;font-size:10.5px;line-height:1.45;padding-left:13px;position:relative;margin:1px 0}
+.verdict:before{content:"";position:absolute;left:0;top:5px;width:7px;height:7px;border-radius:50%;background:currentColor}
+.v-ok{color:var(--good)}.v-warn{color:var(--med)}.v-bad{color:var(--crit)}.v-info{color:var(--info)}.v-none{color:var(--ink3)}
+.apps-hit{display:flex;flex-wrap:wrap;gap:7px}
+.app-hit{border:1px solid var(--line);border-left:4px solid var(--high);border-radius:6px;padding:6px 10px;font-size:10.5px;background:#fff;cursor:pointer;font-family:inherit;text-align:left}
+.app-hit:hover{background:var(--brand-soft)}
+.app-hit.full{border-left-color:var(--crit)}
+.app-hit b{color:var(--brand)}
+.app-hit span{color:var(--ink3);font-size:9.5px;margin-left:6px}
+.scn-list{margin:0;padding-left:18px;font-size:11px;line-height:1.65;color:var(--ink2)}
+.scn-list li{margin-bottom:3px}
+button.dbchip{font:inherit;cursor:pointer;text-align:left}
+button.dbchip:hover{border-color:var(--crit)}
+.topo.scn-pick .dbchip:not(.hit){opacity:.5}
+.dbchip.hit{background:var(--crit-bg);box-shadow:0 0 0 2px var(--crit)}
+
+.foot{font-size:10px;color:var(--ink3);padding:8px 18px;background:#fff;border-top:1px solid var(--line);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hidden{display:none!important}
+
+@media(max-width:1200px){
+  .grid4,.assume,.meta{grid-template-columns:repeat(2,1fr)}
+  .grid3{grid-template-columns:1fr}
+  .app-layout,.srv-layout{grid-template-columns:1fr}
+  .env-grid{grid-template-columns:1fr}
+  .top-stats{display:none}
+  .scn-bar select{min-width:0;width:100%}
+  body{overflow:auto}.shell{height:auto;min-height:100vh}
+}
+@media print{
+  body{overflow:visible}.nav-tabs,.app-side,.srv-list{display:none}
+  .view-panel.hidden{display:block!important}
+  .shell{height:auto}
+}
+</style>
+</head>
+<body>
+<div class="shell">
+
+<header class="top">
+  <div>
+    <h1>SQL Application View</h1>
+    <p id="topLine">Recovery baseline for the current estate. Anything not yet known is shown as NULL.</p>
+  </div>
+  <div class="top-stats" id="globalStats"></div>
+</header>
+
+<nav class="nav-tabs">
+  <button class="nav-tab active" data-view="appView">Application View</button>
+</nav>
+
+<!-- ============================ 1 - FRAMEWORK ============================ -->
+<main id="frameworkView" class="view-panel"><div class="wrap">
+  <div class="panel pad">
+    <h2 class="sec">How this framework works</h2>
+    <p class="lead">Three questions, answered from one inventory: <b>what does each application depend on</b>, <b>how long does it take to bring each thing back</b>, and <b>what else comes down with it</b>. Everything is derived from the workbook and, where collection was run, from read-only queries against the instances themselves. Recovery is counted one database at a time and one instance at a time, because that is the longest it can take. Read this panel first, then the Application Overview, then the SQL Instance MTTR panel.</p>
+
+    <h3 class="sec">The three failure scenarios</h3>
+    <div class="grid3">
+      <div class="card" style="--accent-c:var(--info)">
+        <b class="h">1 &middot; A database is lost</b>
+        <p>Restore that database. Nothing is rebuilt.</p>
+        <span class="formula">MTTR = restore time for that one database</span>
+      </div>
+      <div class="card" style="--accent-c:var(--high)">
+        <b class="h">2 &middot; An application is lost</b>
+        <p>Only the databases that application uses are restored. Other applications on the same instance are not in scope.</p>
+        <span class="formula">MTTR = SQL rebuild + restore of that application's databases + validation</span>
+      </div>
+      <div class="card" style="--accent-c:var(--crit)">
+        <b class="h">3 &middot; A SQL instance is lost</b>
+        <p>SQL Server is rebuilt and <b>every</b> database on it is restored, across all applications. No single application owns this number. If the VM has gone too, the VM build comes first.</p>
+        <span class="formula">MTTR = SQL rebuild + restore of all hosted databases + validation</span>
+      </div>
+    </div>
+
+    <h3 class="sec">Running a scenario</h3>
+    <p class="lead">The Application Overview and SQL Instance panels each have a <b>Scenario run-down</b> drop-down. Pick a failure and the panel walks the recovery step by step: what is rebuilt, each database restored in turn with its time and evidence, the clock after every step, which applications are down, and what the backup and replication facts mean for that failure.</p>
+    <div class="tbl-wrap">
+      <table class="table">
+        <thead><tr><th>Scenario</th><th>Run it from</th><th>What comes back</th><th>What is rebuilt</th><th>What decides the path</th></tr></thead>
+        <tbody>
+          <tr><td><b>Whole application is lost</b></td><td>Application Overview</td><td>Every database the application uses</td><td>SQL Server, on each instance the application sits on</td><td>Whether a replica exists elsewhere</td></tr>
+          <tr><td><b>Database corruption &mdash; restore from backup</b></td><td>Application Overview and SQL Instance</td><td>The databases you tick, from backup</td><td>Nothing</td><td>Recovery model, log backups, last clean CHECKDB. A replica may carry the same damage</td></tr>
+          <tr><td><b>Whole SQL instance is lost</b></td><td>SQL Instance</td><td>Every database on the instance, for every application</td><td>SQL Server. The VM survives</td><td>Whether a replica or cluster covers it</td></tr>
+          <tr><td><b>Whole VM is lost</b></td><td>SQL Instance</td><td>Every SQL instance on the VM, and every database on them, one after another</td><td>The VM, then SQL Server for each instance on it</td><td>As above, for each instance</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 class="sec">Data replication and recovery mechanisms</h3>
+    <p class="lead">Restore time is the baseline, not the plan. Where a replication mechanism exists, recovery is a failover and the restore figure becomes the fallback. Where one does not, the restore figure <em>is</em> the plan.</p>
+    <div class="tbl-wrap">
+      <table class="table">
+        <thead><tr><th>Mechanism</th><th>What recovery looks like</th><th>Effect on MTTR</th><th>What still has to be captured</th></tr></thead>
+        <tbody>
+          <tr><td><b>Always On availability group &mdash; synchronous</b></td><td>Automatic or manual failover to a replica that is already current</td><td>Minutes. The restore figure applies only if every replica is lost</td><td>Replica count, listener, quorum design, tested failover date</td></tr>
+          <tr><td><b>Always On availability group &mdash; asynchronous</b></td><td>Manual failover, accepting the data behind the send queue</td><td>Minutes, plus a data-loss decision</td><td>Measured send-queue lag, who is authorised to accept the loss</td></tr>
+          <tr><td><b>Failover cluster instance</b></td><td>The instance restarts on another node against the same storage</td><td>Minutes, but storage loss is not covered &mdash; that falls back to restore</td><td>Node count, shared storage dependency, patching model</td></tr>
+          <tr><td><b>Log shipping</b></td><td>Manual role change, restore the outstanding log chain</td><td>Copy and restore delay, plus the outstanding chain</td><td>Copy/restore interval, monitored threshold, cutover runbook</td></tr>
+          <tr><td><b>Transactional / merge replication</b></td><td>Not a recovery mechanism. It moves data, it does not protect the database</td><td>No reduction. Restore applies, and replication must then be rebuilt</td><td>Topology, re-initialisation cost after a restore</td></tr>
+          <tr><td><b>Backup and restore only</b></td><td>Rebuild, restore, roll forward, reconnect</td><td>The full figure in this report</td><td>Backup location and its own restore path, media integrity</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 class="sec">How each restore time on this page was arrived at</h3>
+    <p class="lead">Every database resolves down this ladder and stops at the first rung it can stand on. The rung is shown next to the figure, everywhere the figure appears &mdash; including as the coloured edge of every database on the relationship map.</p>
+    <div class="tbl-wrap">
+      <table class="table">
+        <thead><tr><th>Rung</th><th>Basis</th><th>Where it comes from</th></tr></thead>
+        <tbody>
+          <tr><td><span class="badge b-measured">Measured</span></td><td>A restore of this database that was actually timed</td><td>A restore log on the instance (for example <span class="mono">CommandLog</span>), or a duration recorded in the workbook</td></tr>
+          <tr><td><span class="badge b-derived">Derived</span></td><td>This database's own measured backup throughput</td><td><span class="mono">msdb.dbo.backupset</span>: average size divided by average duration for this database on this storage, multiplied by the restore factor you set</td></tr>
+          <tr><td><span class="badge b-none">NULL</span></td><td>Nothing measured</td><td>No timed restore and no backup history. Reported as NULL and left out of every total, never filled in with an assumption</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout">
+      <b>Why there is no assumed rung.</b> An earlier version filled the gaps with an assumed restore throughput and a flat per-database figure. That produces a number precise enough to be quoted and soft enough to be wrong by an order of magnitude. Once collection has run, those gaps are real measurements instead &mdash; so until then they stay NULL, which is a fact somebody can act on.
+    </div>
+
+    <h3 class="sec">Assumptions</h3>
+    <p class="lead">Set these once. They are stored in this browser and every panel recalculates immediately &mdash; no need to re-run the PowerShell. Anything left blank stays NULL rather than defaulting to a number nobody chose.</p>
+    <div class="panel pad" style="background:var(--brand-soft)">
+      <div class="assume">
+        <label>PROD SQL rebuild (hours)<input id="cfgPROD" placeholder="e.g. 3"><span class="hint">Install and configure SQL Server on a VM that exists, to the point a restore can start. Also used for DR.</span></label>
+        <label>UAT SQL rebuild (hours)<input id="cfgUAT" placeholder="e.g. 2"><span class="hint">Used for UAT and SIT</span></label>
+        <label>QA SQL rebuild (hours)<input id="cfgQA" placeholder="e.g. 2"><span class="hint">Used for QA and TEST</span></label>
+        <label>DEV SQL rebuild (hours)<input id="cfgDEV" placeholder="e.g. 1"><span class="hint">Used for DEV and anything unclassified</span></label>
+        <label>PROD VM build (hours)<input id="cfgVmPROD" placeholder="e.g. 4"><span class="hint">Provision a replacement VM, before SQL Server can go on it. Used by the Whole VM scenario. Also used for DR.</span></label>
+        <label>UAT VM build (hours)<input id="cfgVmUAT" placeholder="e.g. 3"><span class="hint">Used for UAT and SIT</span></label>
+        <label>QA VM build (hours)<input id="cfgVmQA" placeholder="e.g. 3"><span class="hint">Used for QA and TEST</span></label>
+        <label>DEV VM build (hours)<input id="cfgVmDEV" placeholder="e.g. 2"><span class="hint">Used for DEV and anything unclassified</span></label>
+        <label>Restore factor<input id="cfgFactor" placeholder="1.0"><span class="hint">Restore time divided by backup time. 1.0 means a restore takes as long as the backup did.</span></label>
+        <label>Validation and handover (hours per instance)<input id="cfgValidation" placeholder="e.g. 1"><span class="hint">Consistency checks, application reconnect, sign-off</span></label>
+        <label>Build runbook URL<input id="cfgBuildDoc" placeholder="https://..."></label>
+        <label>DR runbook URL<input id="cfgDrDoc" placeholder="https://..."></label>
+        <label>Lifecycle reference URL<input id="cfgLifecycle" placeholder="https://..."></label>
+      </div>
+      <div style="display:flex;gap:9px;align-items:center;margin-top:13px;flex-wrap:wrap">
+        <button class="btn" id="saveAssumptions">Save and recalculate</button>
+        <button class="btn sec" id="resetAssumptions">Reset</button>
+        <span id="saveStatus" class="saved"></span>
+      </div>
+    </div>
+
+    <h3 class="sec">Scope</h3>
+    <div class="grid2">
+      <div class="card" style="--accent-c:var(--accent)">
+        <b class="h">What this covers</b>
+        <p>Which applications depend on which databases, on which instances, in which environments. The recovery arithmetic for the three failure scenarios above, and a step-by-step run-down of the four scenarios you can pick. Measured size, compatibility level, backup history, restore history and replication design wherever collection was run.</p>
+      </div>
+      <div class="card" style="--accent-c:var(--med)">
+        <b class="h">What it does not cover</b>
+        <p>None of these are oversights. It does not verify that a backup is restorable &mdash; only a restore proves that. It does not model a site-wide failure, because shared teams and bandwidth break the arithmetic. It does not cover application-tier recovery, network, storage or middleware. It does not price anything. The scenario run-downs name detection, decision-making, failover and log restores, but do not time them &mdash; nothing on this estate measures them.</p>
+      </div>
+    </div>
+  </div>
+</div></main>
+
+<!-- ============================ 2 - APPLICATION OVERVIEW ============================ -->
+<main id="appView" class="view-panel hidden"><div class="wrap">
+  <div class="app-layout">
+    <aside class="app-side">
+      <div class="panel">
+        <div style="padding:13px 13px 0"><input id="appSearch" class="search" placeholder="Search applications" aria-label="Search applications"></div>
+        <div id="appList" class="app-list"></div>
+      </div>
+    </aside>
+    <section>
+      <div class="panel pad" style="margin-bottom:12px">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap">
+          <div>
+            <h2 class="sec" id="appTitle">Select an application</h2>
+            <p class="note" id="appSubtitle">Choose an application to see its relationship map and its recovery time.</p>
+          </div>
+          <select id="envFilter" class="search" style="width:auto;min-width:190px"><option value="ALL">All environments</option></select>
+        </div>
+        <div class="grid2" id="appKpis" style="margin-top:14px"></div>
+        <div id="appDetails" class="callout hidden" style="max-height:120px;overflow:auto"></div>
+        <p class="note" id="appNote" style="margin-top:12px"></p>
+      </div>
+
+      <div class="panel pad hidden" style="margin-bottom:12px">
+        <b style="color:var(--brand);font-size:13px">Scenario run-down</b>
+        <p class="note" style="margin:5px 0 12px">Pick a failure and walk the recovery step by step. The environment filter above applies.</p>
+        <div id="appScnControls"></div>
+        <div id="appScnResult"></div>
+      </div>
+
+      <div class="panel" style="margin-bottom:12px">
+        <div style="padding:15px 18px 0">
+          <b style="color:var(--brand);font-size:13px">Application relationship map</b>
+          <p class="note" style="margin:5px 0 0">Application, then environment, then SQL instance, then the databases on it. Click a SQL instance name to open its complete recovery scope. With a database scenario picked above, click a database to add it to the scenario or take it out.</p>
+        </div>
+        <div class="topo" id="appTopo"></div>
+        <div class="map-legend" id="appTopoLegend"></div>
+      </div>
+
+      <div id="appEnvironments" class="hidden"></div>
+    </section>
+  </div>
+</div></main>
+
+<!-- ============================ 3 - SQL INSTANCE MTTR ============================ -->
+<main id="serverView" class="view-panel hidden"><div class="wrap">
+  <div class="srv-layout">
+    <aside class="app-side">
+      <div class="panel">
+        <div style="padding:13px 13px 0"><input id="srvSearch" class="search" placeholder="Search SQL instances" aria-label="Search SQL instances"></div>
+        <div id="srvList" class="srv-list"></div>
+      </div>
+    </aside>
+    <section id="srvDetail" class="panel pad"><div class="empty">Select a SQL instance.</div></section>
+  </div>
+</div></main>
+
+<!-- ============================ 4 - EXECUTIVE DECK ============================ -->
+<main id="deckView" class="view-panel hidden"><div class="wrap">
+  <div class="deck-hero">
+    <h2>Recovery baseline for the SQL estate</h2>
+    <p id="deckLead"></p>
+  </div>
+  <div class="grid4" id="deckKpis"></div>
+
+  <h3 class="sec">The three failure scenarios, against this estate</h3>
+  <div class="grid3" id="deckScenarios"></div>
+
+  <div class="callout warn" style="margin-top:14px">
+    <b>This panel is in working.</b> It states what the estate is and what it currently takes to recover, nothing more. Once the measured figures are in, this becomes the page that says where to act. Until then the detail lives on the Application Overview and SQL Instance MTTR panels.
+  </div>
+</div></main>
+
+<footer class="foot">Source: __SOURCE__ &nbsp;|&nbsp; Generated: __GENERATED__ &nbsp;|&nbsp; Connectivity: __CONNECTIVITY__ &nbsp;|&nbsp; Evidence: __COLLECTION__</footer>
+</div>
+
+<script>
+"use strict";
+const raw = __JSON__;
+const applicationDetails = __DETAILS_JSON__;
+const instanceMeta = __INSTANCE_JSON__;
+const SIMULATED = __SIMULATED__;
+
+/* ---------------------------------------------------------------------------
+   Helpers. Anything not known prints as NULL - never zero, never a phrase.
+--------------------------------------------------------------------------- */
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const uniq = a => [...new Set(a)];
+const num = v => { const n = Number(v); return Number.isFinite(n) ? n : null; };
+const slug = s => String(s).replace(/\s+/g, '-');
+const sum = a => a.reduce((t, x) => t + x, 0);
+const byName = (a, b) => String(a).localeCompare(String(b));
+
+const NUL = '<span class="nul">NULL</span>';
+const nz = v => (v === null || v === undefined || v === '') ? NUL : esc(String(v));
+
+const COMPAT = {60:'SQL Server 6.0',65:'SQL Server 6.5',70:'SQL Server 7.0',80:'SQL Server 2000',90:'SQL Server 2005',
+  100:'SQL Server 2008 / 2008 R2',110:'SQL Server 2012',120:'SQL Server 2014',130:'SQL Server 2016',
+  140:'SQL Server 2017',150:'SQL Server 2019',160:'SQL Server 2022',170:'SQL Server 2025'};
+const compatLabel = v => { const n = num(v); return (n && COMPAT[n]) ? `${n} (${COMPAT[n]})` : (n ? String(n) : null); };
+
+/* A product version like 10.50.6000.34 means nothing to the person reading the report.
+   Show the release name, and keep the build number for whoever needs it. */
+const SQL_MAJOR = {'8':'SQL Server 2000','9':'SQL Server 2005','10.0':'SQL Server 2008','10.50':'SQL Server 2008 R2',
+  '11':'SQL Server 2012','12':'SQL Server 2014','13':'SQL Server 2016','14':'SQL Server 2017','15':'SQL Server 2019',
+  '16':'SQL Server 2022','17':'SQL Server 2025'};
+function sqlRelease(version) {
+  if (!version) return null;
+  const clean = String(version).trim();
+  const named = clean.match(/(?:SQL\s*Server\s*)?((?:20)?(?:00|05|08|12|14|16|17|19|22|25))(\s*R2)?/i);
+  const parts = clean.split('.');
+  if (parts.length >= 2) {
+    const two = `${parts[0]}.${parts[1]}`;
+    if (SQL_MAJOR[two]) return SQL_MAJOR[two];
+    if (SQL_MAJOR[parts[0]]) return SQL_MAJOR[parts[0]];
+  }
+  /* A workbook can hold "2016" or "SQL Server 2016" rather than a build number. */
+  if (named) {
+    const year = named[1].length === 2 ? '20' + named[1] : named[1];
+    return `SQL Server ${year}${named[2] ? ' R2' : ''}`;
+  }
+  return null;
+}
+/* "SQL Server 2019" where the release is known, otherwise the raw string, otherwise NULL. */
+function versionLabel(meta) {
+  if (!meta || !meta.version) return null;
+  return sqlRelease(meta.version) || String(meta.version);
+}
+function versionFull(meta) {
+  if (!meta || !meta.version) return null;
+  const release = sqlRelease(meta.version);
+  const build = String(meta.version);
+  const level = meta.productLevel ? ` ${meta.productLevel}` : '';
+  return (release && release !== build) ? `${release} (${build}${level})` : `${build}${level}`;
+}
+
+/* Environment colour is how a name carries its context. Lists are ordered by name; the
+   colour is what tells you whether the row is production. The same hex values drive the
+   CSS tags, the environment cards and the spread counts. */
+const ENV_ORDER = ['PROD','PRD','PRODUCTION','DR','UAT','SIT','QA','TEST','DEV','SANDBOX','NONPROD','UNKNOWN'];
+const ENV_HEX = {PROD:'#C6093B',PRD:'#C6093B',PRODUCTION:'#C6093B',DR:'#6B4BA3',UAT:'#D9660A',
+  SIT:'#0F6FA8',QA:'#0F6FA8',TEST:'#0F6FA8',DEV:'#00875D',SANDBOX:'#00695C',NONPROD:'#7B8397',UNKNOWN:'#7B8397'};
+const envRank = e => { const i = ENV_ORDER.indexOf(String(e).toUpperCase()); return i < 0 ? ENV_ORDER.length : i; };
+const envClass = e => 'env-' + String(e).toUpperCase().replace(/[^A-Z]/g, '');
+const envHex = e => ENV_HEX[String(e).toUpperCase()] || '#7B8397';
+const envTag = e => `<span class="env ${envClass(e)}">${esc(e)}</span>`;
+const isProd = e => /^(PROD|PRD|PRODUCTION)$/i.test(String(e));
+
+/* How a set of databases is spread across environments, as counts. "PROD 4 UAT 1 DEV 1"
+   is one glance; a row of markers is arithmetic the reader should not have to do. */
+function envCounts(dbs) {
+  const m = new Map();
+  dbs.forEach(d => m.set(d.environment, (m.get(d.environment) || 0) + 1));
+  return [...m.entries()].sort((a, b) => envRank(a[0]) - envRank(b[0]));
+}
+const spreadHtml = dbs => `<span class="spread">` + envCounts(dbs)
+  .map(([e, n]) => `<span class="ec" style="--env-c:${envHex(e)}">${esc(e)} ${n}</span>`).join('') + `</span>`;
+const spreadText = dbs => envCounts(dbs).map(([e, n]) => `${e} ${n}`).join(' / ');
+
+/* Evidence basis colours, used on the edge of every database chip. */
+const BASIS_HEX = { measured:'#00875D', derived:'#0067B9', none:'#7B8397' };
+
+/* Hours are the unit of the conversation. Minutes are the unit of the arithmetic. */
+function hoursText(minutes) {
+  if (minutes === null || minutes === undefined) return 'NULL';
+  const h = minutes / 60;
+  if (h < 1) return `${Math.max(1, Math.round(minutes))} min`;
+  if (h < 10) return `${h.toFixed(1)} h`;
+  return `${Math.round(h)} h`;
+}
+const fmtH = m => (m === null || m === undefined) ? NUL : hoursText(m);
+const gbText = g => (g === null || g === undefined) ? 'NULL' : (g >= 1024 ? `${(g/1024).toFixed(2)} TB` : `${g.toFixed(1)} GB`);
+const fmtGb = g => (g === null || g === undefined) ? NUL : gbText(g);
+
+/* ---------------------------------------------------------------------------
+   Assumptions. Blank stays blank: an unset value is reported as NULL rather
+   than silently defaulting to a number nobody chose.
+--------------------------------------------------------------------------- */
+/* A simulated report keeps its own assumptions, pre-filled with example values, so trying
+   the simulator never overwrites what was entered for a real report in the same browser. */
+const CFG_KEY = SIMULATED ? 'sqlMttrConfig.v6.simulated' : 'sqlMttrConfig.v6';
+const CFG_DEFAULT = SIMULATED
+  ? { build:{PROD:'3',UAT:'2',QA:'2',DEV:'1'}, vm:{PROD:'4',UAT:'3',QA:'3',DEV:'2'}, factor:'1.0', validation:'1',
+      buildDoc:'', drDoc:'', lifecycle:'' }
+  : { build:{PROD:'',UAT:'',QA:'',DEV:''}, vm:{PROD:'',UAT:'',QA:'',DEV:''}, factor:'1.0', validation:'',
+      buildDoc:'', drDoc:'', lifecycle:'' };
+let cfg = (() => {
+  try {
+    const stored = JSON.parse(localStorage.getItem(CFG_KEY) || '{}');
+    return { ...CFG_DEFAULT, ...stored,
+             build: { ...CFG_DEFAULT.build, ...(stored.build || {}) },
+             vm: { ...CFG_DEFAULT.vm, ...(stored.vm || {}) } };
+  } catch (e) { return JSON.parse(JSON.stringify(CFG_DEFAULT)); }
+})();
+
+const envBucket = environment => {
+  const e = String(environment).toUpperCase();
+  if (/^(PROD|PRD|PRODUCTION|DR)$/.test(e)) return 'PROD';
+  if (/^(UAT|SIT)$/.test(e)) return 'UAT';
+  if (/^(QA|TEST)$/.test(e)) return 'QA';
+  return 'DEV';
+};
+/* SQL Server onto a VM that exists, to the point a restore can start. */
+const buildHours = environment => num(cfg.build[envBucket(environment)]);
+/* A replacement VM, before SQL Server can go on it. Only the Whole VM scenario uses it. */
+const vmHours = environment => num(cfg.vm[envBucket(environment)]);
+
+/* ---------------------------------------------------------------------------
+   The model. One database is one row here, however many times the workbook
+   listed it, so a repeated row never adds a second restore.
+--------------------------------------------------------------------------- */
+const dbKey = r => `${String(r.instance).toUpperCase()}|${String(r.database).toUpperCase()}`;
+
+const databases = (() => {
+  const map = new Map();
+  raw.forEach(r => {
+    const k = dbKey(r);
+    if (!map.has(k)) {
+      map.set(k, { key:k, instance:r.instance, server:r.server, database:r.database,
+        environments:new Set(), applications:new Set(),
+        sizeGb:r.sizeGb, compatibility:r.compatibility, recoveryModel:r.recoveryModel,
+        state:r.state, mechanism:r.mechanism,
+        backupThroughputMBs:r.backupThroughputMBs, backupMinutes:r.backupMinutes,
+        lastFullBackup:r.lastFullBackup, lastLogBackup:r.lastLogBackup,
+        lastGoodCheckDb:r.lastGoodCheckDb, lastRestore:r.lastRestore,
+        timedRestoreMinutes:r.timedRestoreMinutes, timedRestoreSamples:r.timedRestoreSamples,
+        timedRestoreSource:r.timedRestoreSource, connectivity:r.connectivity });
+    }
+    const d = map.get(k);
+    d.environments.add(r.environment);
+    d.applications.add(r.application);
+  });
+  map.forEach(d => {
+    d.environment = [...d.environments].sort((a, b) => envRank(a) - envRank(b))[0];
+    d.apps = [...d.applications].sort(byName);
+    d.shared = d.apps.length > 1;
+  });
+  return map;
+})();
+
+const instances = (() => {
+  const map = new Map();
+  databases.forEach(d => {
+    if (!map.has(d.instance)) {
+      map.set(d.instance, { instance:d.instance, server:d.server, databases:[], apps:new Set(), environments:new Set() });
+    }
+    const i = map.get(d.instance);
+    i.databases.push(d);
+    d.apps.forEach(a => i.apps.add(a));
+    d.environments.forEach(e => i.environments.add(e));
+  });
+  map.forEach(i => {
+    i.environment = [...i.environments].sort((a, b) => envRank(a) - envRank(b))[0];
+    i.appList = [...i.apps].sort(byName);
+    i.databases.sort((a, b) => byName(a.database, b.database));
+    i.meta = instanceMeta.find(m => m.instance === i.instance) || null;
+    i.siblings = 0;
+  });
+  /* Two named instances on one host are still two instances, but they share a machine.
+     The list says so, so nobody reads them as unrelated. */
+  const byServer = new Map();
+  map.forEach(i => { const s = String(i.server || '').toUpperCase(); byServer.set(s, (byServer.get(s) || 0) + 1); });
+  map.forEach(i => { i.siblings = (byServer.get(String(i.server || '').toUpperCase()) || 1) - 1; });
+  return map;
+})();
+
+const applications = (() => {
+  const map = new Map();
+  raw.forEach(r => {
+    if (!map.has(r.application)) map.set(r.application, { name:r.application, rows:[], dbKeys:new Set() });
+    const a = map.get(r.application);
+    a.rows.push(r);
+    a.dbKeys.add(dbKey(r));
+  });
+  map.forEach(a => { a.dbs = [...a.dbKeys].map(k => databases.get(k)); });
+  return map;
+})();
+
+/* ---------------------------------------------------------------------------
+   The evidence ladder: measured, derived, or NULL. Nothing is invented.
+--------------------------------------------------------------------------- */
+function restoreOf(db) {
+  if (db.timedRestoreMinutes != null) {
+    const n = db.timedRestoreSamples || 1;
+    return { minutes: db.timedRestoreMinutes, basis: 'measured', label: 'Measured',
+             detail: `Timed restore, ${n} run${n === 1 ? '' : 's'}${db.timedRestoreSource ? ' - ' + db.timedRestoreSource : ''}` };
+  }
+  const factor = num(cfg.factor);
+  if (db.backupThroughputMBs != null && db.sizeGb != null && factor !== null) {
+    return { minutes: (db.sizeGb * 1024 / db.backupThroughputMBs / 60) * factor, basis: 'derived', label: 'Derived',
+             detail: `${db.sizeGb.toFixed(1)} GB at a measured ${db.backupThroughputMBs} MB/s backup throughput, x ${factor} restore factor` };
+  }
+  return { minutes: null, basis: 'none', label: 'NULL',
+           detail: 'No timed restore and no backup history for this database. Run collection to measure it.' };
+}
+
+const basisBadge = r => `<span class="badge b-${r.basis}" title="${esc(r.detail)}">${esc(r.label)}</span>`;
+
+/* One database at a time. That is the longest it can take, and it is the figure to plan against. */
+function restoreWorkload(dbs) {
+  const parts = dbs.map(restoreOf);
+  const known = parts.filter(p => p.minutes !== null).map(p => p.minutes);
+  return {
+    total: known.length ? sum(known) : null,
+    counted: known.length,
+    unquantified: parts.length - known.length,
+    mix: { measured: parts.filter(p => p.basis === 'measured').length,
+           derived:  parts.filter(p => p.basis === 'derived').length,
+           none:     parts.filter(p => p.basis === 'none').length }
+  };
+}
+
+/* One leg is one instance's share of a recovery: a rebuild where one is needed, the restores,
+   then validation. A leg needing a rebuild nobody has sized, or with no restore figure at all,
+   is NULL. The headline figures and the scenario run-downs both use this, so they agree. */
+function buildMinutesFor(environment) {
+  const build = buildHours(environment);
+  return build === null ? null : build * 60;
+}
+function vmMinutesFor(environment) {
+  const vm = vmHours(environment);
+  return vm === null ? null : vm * 60;
+}
+function legTotal(work, buildMinutes, needsBuild) {
+  if (work.total === null) return null;
+  if (needsBuild && buildMinutes === null) return null;
+  return work.total + (needsBuild ? buildMinutes : 0) + (num(cfg.validation) || 0) * 60;
+}
+
+/* Scenario 3 - the whole instance is gone. */
+function instanceMttr(inst) {
+  const work = restoreWorkload(inst.databases);
+  const buildMinutes = buildMinutesFor(inst.environment);
+  return { ...work, buildMinutes, complete: legTotal(work, buildMinutes, true) };
+}
+
+/* Scenario 2 - the application is gone. Only its own databases are in scope, even where
+   the instance is shared, but the rebuild of each instance it sits on still applies. */
+function applicationMttr(app, environmentFilter) {
+  const dbs = app.dbs.filter(d => environmentFilter === 'ALL' || d.environments.has(environmentFilter));
+  const byInstance = new Map();
+  dbs.forEach(d => {
+    if (!byInstance.has(d.instance)) byInstance.set(d.instance, []);
+    byInstance.get(d.instance).push(d);
+  });
+
+  const legs = [...byInstance.entries()].sort((a, b) => byName(a[0], b[0])).map(([instanceName, instanceDbs]) => {
+    const inst = instances.get(instanceName);
+    const work = restoreWorkload(instanceDbs);
+    const buildMinutes = buildMinutesFor(inst.environment);
+    return { instance: inst, dbs: instanceDbs.slice().sort((a, b) => byName(a.database, b.database)),
+             work, buildMinutes, total: legTotal(work, buildMinutes, true) };
+  });
+
+  const totals = legs.map(l => l.total).filter(t => t !== null);
+  const complete = totals.length === legs.length && legs.length > 0 ? sum(totals) : null;
+
+  const mix = { measured: 0, derived: 0, none: 0 };
+  legs.forEach(l => Object.keys(mix).forEach(k => mix[k] += l.work.mix[k]));
+
+  return { dbs, legs, complete, mix,
+           collateral: uniq(legs.flatMap(l => l.instance.appList)).filter(a => a !== app.name).sort(byName) };
+}
+
+const kpiHtml = ([label, value, sub, colour]) =>
+  `<div class="kpi" style="--accent-c:${colour}"><b>${value}</b><span class="lbl">${esc(label)}</span><span class="sub">${sub}</span></div>`;
+
+/* ---------------------------------------------------------------------------
+   Scenario run-down. Pick a failure and what it hits, then walk the recovery
+   one step at a time - the longest it can take. Every duration is either a
+   restore figure off the evidence ladder or one of the operator's own
+   assumptions, and the step says which. Detection, decisions, failover and log
+   restores are named but never timed: nothing on the estate measures them.
+--------------------------------------------------------------------------- */
+const WINDOW_DAYS = __WINDOW_DAYS__;
+
+const SCENARIOS = {
+  'app-lost':  { label: 'Whole application is lost', family: 'lost', rebuild: true, colour: 'var(--high)',
+                 what: 'Every database this application uses is restored, after SQL Server is rebuilt on each instance it sits on.' },
+  'corrupt':   { label: 'Database corruption - restore from backup', family: 'corrupt', rebuild: false, colour: 'var(--info)',
+                 what: 'The databases you tick are restored from backup, one at a time. Nothing is rebuilt.' },
+  'inst-lost': { label: 'Whole SQL instance is lost', family: 'lost', rebuild: true, colour: 'var(--crit)',
+                 what: 'The VM survives. SQL Server is rebuilt and every database on this instance is restored, whichever application owns it.' },
+  'vm-lost':   { label: 'Whole VM is lost', family: 'lost', rebuild: true, vm: true, colour: 'var(--crit)',
+                 what: 'The VM is gone. It is rebuilt first, then SQL Server and every database for each instance on it, one after another.' }
+};
+const APP_SCENARIOS = ['app-lost', 'corrupt'];
+const INSTANCE_SCENARIOS = ['inst-lost', 'corrupt', 'vm-lost'];
+const RESTORE_VERB = { lost: 'Restore', corrupt: 'Restore from backup' };
+const STEP_LABEL = { vm: 'VM build', rebuild: 'SQL rebuild', restore: 'Restore', validate: 'Validate' };
+
+/* What kind of second copy a database has. Collected text and workbook text both land here. */
+function mechClass(mechanism) {
+  const t = String(mechanism || '').trim().toLowerCase();
+  if (!t) return 'unknown';
+  if (/mirror/.test(t)) return 'mirror';
+  if (/log ?shipping/.test(t)) return 'logship';
+  if (/always ?on|availability group|\bag\b/.test(t)) {
+    if (/asynchronous|\basync/.test(t)) return 'async';
+    return /synchronous|\bsync/.test(t) ? 'sync' : 'async';
+  }
+  if (/cluster|\bfci\b/.test(t)) return 'fci';
+  if (/replication/.test(t)) return 'repl';
+  if (/backup|standalone|^none$|^n\/?a$/.test(t)) return 'backup';
+  return 'unknown';
+}
+const HAS_REPLICA = ['sync', 'async', 'mirror', 'logship'];
+
+/* What a second copy does and does not do for each kind of failure. */
+const MECH_NOTE = {
+  lost: {
+    sync:    ['ok', 'A synchronous replica elsewhere can take this database off the critical path.'],
+    async:   ['ok', 'An asynchronous replica elsewhere can take this off the critical path, with some data loss.'],
+    mirror:  ['ok', 'A mirror elsewhere can take this database off the critical path.'],
+    logship: ['ok', 'A log shipping secondary can take this off the critical path, behind by the logs not yet restored.'],
+    fci:     ['info', 'The cluster covers a failed node, not lost storage. If the storage has gone, the restore applies.'],
+    repl:    ['info', 'Replication is not recovery. Restore, then re-initialise replication.'],
+    backup:  ['info', 'No replica. Restore is the plan.'],
+    unknown: ['none', 'Replication / HA is NULL. Treat restore as the plan until it is confirmed.']
+  },
+  corrupt: {
+    sync:    ['warn', 'The synchronous replica may hold the same corruption. Check it with DBCC CHECKDB before failing over; otherwise restore.'],
+    async:   ['warn', 'The asynchronous replica may hold the same corruption. Check it with DBCC CHECKDB before failing over; otherwise restore.'],
+    mirror:  ['warn', 'The mirror may hold the same corruption. Check it before failing over; otherwise restore.'],
+    logship: ['warn', 'The log shipping secondary may still be clean if it has not applied the damaged log. Check it before a role change.'],
+    fci:     ['info', 'The cluster runs on one copy of the storage, so failover does not help. Restore is the path.'],
+    repl:    ['info', 'Replication is not recovery. Restore, then re-initialise replication.'],
+    backup:  ['info', 'No replica. Restore is the plan.'],
+    unknown: ['none', 'Replication / HA is NULL. Confirm it before relying on anything but a restore.']
+  }
+};
+
+const plural = (n, one, many) => `${n} ${n === 1 ? one : (many || one + 's')}`;
+const dbName = d => `<b>${esc(d.database)}</b> ${envTag(d.environment)}`;
+const nameList = (items, max) => items.slice(0, max).join(', ') + (items.length > max ? ` and ${items.length - max} more` : '');
+const clockText = m => m <= 0 ? '0 h' : hoursText(m);
+
+/* Evidence was only looked for where collection reached the instance. "None found" and
+   "never looked" are different statements, and the run-down keeps them apart. */
+const wasCollected = d => { const i = instances.get(d.instance); return !!(i && i.meta && i.meta.status === 'Collected'); };
+const NOT_COLLECTED = '<span class="nul">Not collected</span>';
+const seen = (d, value, show) => (value !== null && value !== undefined && value !== '')
+  ? show(value) : (wasCollected(d) ? NUL : NOT_COLLECTED);
+const backupCell = (d, value, severe) => value ? `<span class="mono">${esc(value)}</span>`
+  : (wasCollected(d) ? `<span class="${severe ? 'v-bad' : ''}">None in ${WINDOW_DAYS} days</span>` : NOT_COLLECTED);
+
+/* Production first, then by instance name, then by database name. */
+function groupByInstance(dbs) {
+  const m = new Map();
+  dbs.forEach(d => { if (!m.has(d.instance)) m.set(d.instance, []); m.get(d.instance).push(d); });
+  return [...m.entries()]
+    .map(([name, list]) => [instances.get(name), list.slice().sort((a, b) => byName(a.database, b.database))])
+    .sort((a, b) => envRank(a[0].environment) - envRank(b[0].environment) || byName(a[0].instance, b[0].instance));
+}
+const defaultPick = pool => { const first = groupByInstance(pool).flatMap(([, list]) => list)[0]; return first ? [first.key] : []; };
+
+function runScenario(kind, dbs) {
+  const spec = SCENARIOS[kind];
+  const validation = num(cfg.validation);
+  const legs = groupByInstance(dbs).map(([inst, list]) => ({ inst, dbs: list }));
+
+  const steps = [];
+  let clock = 0, open = false;
+  const add = step => {
+    step.start = clock;
+    if (step.minutes === null) open = true; else clock += step.minutes;
+    step.end = clock;
+    step.open = open;
+    steps.push(step);
+  };
+
+  /* A lost VM is rebuilt once, before anything else can start. Its environment is the most
+     critical one among the instances it carries. */
+  let vm = null;
+  if (spec.vm && legs.length) {
+    const environment = legs[0].inst.environment;
+    vm = { name: legs[0].inst.server, environment, minutes: vmMinutesFor(environment) };
+    add({ kind: 'vm', leg: null, vm, minutes: vm.minutes });
+  }
+
+  legs.forEach(leg => {
+    leg.buildMinutes = buildMinutesFor(leg.inst.environment);
+    leg.work = restoreWorkload(leg.dbs);
+    leg.total = legTotal(leg.work, leg.buildMinutes, spec.rebuild);
+    if (spec.rebuild) add({ kind: 'rebuild', leg, minutes: leg.buildMinutes });
+    leg.dbs.forEach(d => { const r = restoreOf(d); add({ kind: 'restore', leg, db: d, r, minutes: r.minutes }); });
+    add({ kind: 'validate', leg, minutes: validation === null ? null : validation * 60 });
+  });
+
+  const legsTotal = legs.length && legs.every(l => l.total !== null) ? sum(legs.map(l => l.total)) : null;
+  const total = (legsTotal === null || (vm && vm.minutes === null)) ? null : legsTotal + (vm ? vm.minutes : 0);
+
+  const hitKeys = new Set(dbs.map(d => d.key));
+  const appsHit = uniq(dbs.flatMap(d => d.apps)).map(name => {
+    const a = applications.get(name);
+    const hit = a.dbs.filter(d => hitKeys.has(d.key)).length;
+    return { name, hit, of: a.dbs.length, full: hit === a.dbs.length };
+  }).sort((a, b) => (b.full - a.full) || byName(a.name, b.name));
+
+  return { kind, spec, dbs, legs, vm, steps, total, clock, appsHit };
+}
+
+/* One plain paragraph that says what happened and what it takes, from the run's own numbers. */
+function scenarioStory(run, ctx) {
+  const n = run.dbs.length, k = run.legs.length, a = run.appsHit.length;
+  const full = run.appsHit.filter(x => x.full).length;
+  const where = k === 1 ? `on <b>${esc(run.legs[0].inst.instance)}</b> ${envTag(run.legs[0].inst.environment)}` : `across ${k} SQL instances`;
+  const subject = n === 1 ? dbName(run.dbs[0]) : `${n} databases`;
+  const appNames = nameList(run.appsHit.map(x => `<b>${esc(x.name)}</b>`), 4);
+  const affected = a
+    ? `${plural(a, 'application')} ${a === 1 ? 'depends' : 'depend'} on ${n === 1 ? 'it' : 'them'}: ${appNames}.`
+    : `No application is recorded against ${n === 1 ? 'it' : 'them'}.`;
+
+  const down = `${plural(a, 'application')} ${a === 1 ? 'is' : 'are'} down until then &mdash; ${full} completely, ${a - full} partly: ${appNames}.`;
+
+  switch (run.kind) {
+    case 'app-lost': {
+      const others = run.appsHit.filter(x => x.name !== ctx.app.name).length;
+      const shared = ctx.collateral.length;
+      return `<b>${esc(ctx.app.name)}</b> is lost${ctx.filter !== 'ALL' ? ` in ${envTag(ctx.filter)}` : ''}. Its ${plural(n, 'database')} ${where} ${n === 1 ? 'is' : 'are'} restored one at a time, after SQL Server is rebuilt on each instance.`
+        + (others ? ` ${plural(others, 'other application')} ${others === 1 ? 'uses' : 'use'} some of the same databases and ${others === 1 ? 'loses' : 'lose'} them too.` : '')
+        + (shared ? ` ${plural(shared, 'other application')} ${shared === 1 ? 'shares' : 'share'} these instances but ${shared === 1 ? 'is' : 'are'} not restored here.` : '');
+    }
+    case 'corrupt':
+      return `${subject} ${where} ${n === 1 ? 'is' : 'are'} corrupt. ${n === 1 ? 'It is' : 'Each is'} restored from backup, one at a time; nothing is rebuilt. ${affected}`;
+    case 'inst-lost':
+      return `<b>${esc(ctx.inst.instance)}</b> ${envTag(ctx.inst.environment)} is lost, but its VM <b>${esc(ctx.inst.server)}</b> survives. SQL Server is rebuilt and all ${plural(n, 'database')} on it restored, one at a time. ${down}`;
+    case 'vm-lost': {
+      const list = run.legs.map(l => `<b>${esc(l.inst.instance)}</b> ${envTag(l.inst.environment)}`).join(', ');
+      return `VM <b>${esc(run.vm.name)}</b> is lost` + (k === 1 ? `. It runs one SQL instance, ${list}.` : `, taking ${k} SQL instances with it: ${list}.`)
+        + ` The VM is rebuilt first, then SQL Server and all ${plural(n, 'database')} ${k === 1 ? 'on it' : 'for each instance in turn'}. ${down}`;
+    }
+  }
+  return '';
+}
+
+/* Observed facts about one database, read for this particular failure. */
+function scenarioFindings(family, d) {
+  const out = [];
+  const got = wasCollected(d);
+  const model = String(d.recoveryModel || '').toUpperCase();
+
+  if (d.state && d.state !== 'ONLINE') out.push(['bad', `Observed state is ${d.state}.`]);
+  if (got && !d.lastFullBackup) out.push(['bad', `No full backup in the last ${WINDOW_DAYS} days. There is nothing to restore from.`]);
+
+  if (family === 'corrupt' && d.lastFullBackup) {
+    if (model === 'SIMPLE') {
+      out.push(['warn', `SIMPLE recovery: it can only go back to the last full backup (${d.lastFullBackup}). Everything after that is lost.`]);
+    } else if (model === 'FULL' || model === 'BULK_LOGGED') {
+      if (d.lastLogBackup) out.push(['ok', `Can be restored to just before the damage. Log backups run up to ${d.lastLogBackup}.`]);
+      else out.push(['warn', `${model} recovery, but no log backup in the last ${WINDOW_DAYS} days. Only the last full backup can be restored.`]);
+    }
+  }
+  if (family === 'corrupt') {
+    if (d.lastGoodCheckDb === 'Never') out.push(['bad', 'No clean DBCC CHECKDB on record. Any backup may carry the same corruption.']);
+    else if (d.lastGoodCheckDb) out.push(['info', `Last clean CHECKDB ${d.lastGoodCheckDb}. Backups taken after that are not proven clean.`]);
+  }
+
+  out.push(MECH_NOTE[family][mechClass(d.mechanism)]);
+
+  if (family === 'corrupt' && d.shared) {
+    out.push(['warn', `Used by ${d.apps.length} applications. All of them are down until it is back.`]);
+  }
+  return out;
+}
+
+function scenarioRemedies(run) {
+  const fam = run.spec.family;
+  const out = [];
+  const restores = run.steps.filter(s => s.kind === 'restore' && s.minutes !== null).map(s => s.minutes);
+  if (restores.length > 1) {
+    out.push(`Restoring the ${restores.length} databases at the same time instead of one after another would bring the restore portion from ${hoursText(sum(restores))} to about ${hoursText(Math.max(...restores))}, the longest single restore &mdash; if the storage and people exist to run them together.`);
+  }
+  const builds = run.steps.filter(s => s.kind === 'rebuild' && s.minutes !== null).map(s => s.minutes);
+  if (builds.length > 1) {
+    out.push(`Rebuilding SQL Server on the ${builds.length} instances at the same time would bring that portion from ${hoursText(sum(builds))} to ${hoursText(Math.max(...builds))}.`);
+  }
+  if (run.vm) {
+    out.push('A standby VM takes the VM build off the critical path; a VM template with SQL Server already installed shortens the SQL rebuild on every instance.');
+  }
+  if (fam === 'lost') {
+    const replicas = run.dbs.filter(d => HAS_REPLICA.includes(mechClass(d.mechanism))).length;
+    const rest = run.dbs.length - replicas;
+    if (replicas) out.push(`${replicas} of these ${run.dbs.length} databases have a replica elsewhere. A tested failover takes them out of the restore path.`);
+    if (rest) out.push(`A synchronous replica or warm standby for ${replicas ? `the other ${plural(rest, 'database')}` : (rest === 1 ? 'this database' : `these ${rest} databases`)} takes the restore off the critical path entirely.`);
+  }
+  if (fam === 'corrupt') {
+    const simple = run.dbs.filter(d => String(d.recoveryModel || '').toUpperCase() === 'SIMPLE').length;
+    if (simple) out.push(`${plural(simple, 'database')} ${simple === 1 ? 'runs' : 'run'} in SIMPLE recovery. FULL recovery with regular log backups would let ${simple === 1 ? 'it' : 'them'} go back to just before the damage, not only to the last full backup.`);
+    const never = run.dbs.filter(d => d.lastGoodCheckDb === 'Never').length;
+    if (never) out.push(`${plural(never, 'database')} ${never === 1 ? 'has' : 'have'} no clean DBCC CHECKDB on record. A scheduled integrity check shows which backup is safe to restore.`);
+  }
+  return out;
+}
+
+function scenarioGaps(run, ctx) {
+  const out = [];
+  const nullDbs = run.steps.filter(s => s.kind === 'restore' && s.minutes === null).map(s => s.db);
+  if (nullDbs.length) {
+    out.push(`${plural(nullDbs.length, 'database')} with a NULL restore time: ${nameList(nullDbs.map(d => esc(d.database)), 6)}. Run collection (-CollectSqlEvidence) to measure ${nullDbs.length === 1 ? 'it' : 'them'}; until then the real figure is higher.`);
+  }
+  if (run.vm && run.vm.minutes === null) out.push(`${esc(envBucket(run.vm.environment))} VM build hours are NULL, so the time to recover is NULL. Enter them on the Framework panel.`);
+  const nullBuild = uniq(run.steps.filter(s => s.kind === 'rebuild' && s.minutes === null).map(s => envBucket(s.leg.inst.environment)));
+  if (nullBuild.length) out.push(`${esc(nullBuild.join(', '))} SQL rebuild hours are NULL, so the time to recover is NULL. Enter them on the Framework panel.`);
+  if (run.steps.some(s => s.kind === 'validate' && s.minutes === null)) out.push('Validation hours are NULL and counted as nothing. Enter them on the Framework panel.');
+  out.push('Detecting the failure and deciding to act.');
+  out.push('Log backups restored on top of the full backup, unless the timed restore already included them.');
+  if (run.spec.family === 'lost') out.push('Failing over to a replica. It has never been timed here, so the timeline shows the restore path.');
+  if (run.kind === 'app-lost' && ctx.collateral.length) out.push(`${plural(ctx.collateral.length, 'other application')} on the same instances. Their databases are not restored in this scenario.`);
+  return out;
+}
+
+const CHECK_COLS = {
+  lost:    ['size', 'backup', 'model', 'mech'],
+  corrupt: ['backup', 'log', 'model', 'checkdb', 'mech']
+};
+const CHECK_CELLS = {
+  size:    ['Size', d => fmtGb(d.sizeGb), 'num mono'],
+  backup:  ['Last full backup', d => backupCell(d, d.lastFullBackup, true), ''],
+  log:     ['Last log backup', d => backupCell(d, d.lastLogBackup, false), ''],
+  model:   ['Recovery model', d => seen(d, d.recoveryModel, esc), ''],
+  checkdb: ['Last clean CHECKDB', d => seen(d, d.lastGoodCheckDb, v => v === 'Never' ? '<span class="v-bad">Never</span>' : `<span class="mono">${esc(v)}</span>`), ''],
+  mech:    ['Replication / HA', d => nz(d.mechanism), '']
+};
+
+function scenarioResultHtml(run, ctx) {
+  const spec = run.spec, fam = spec.family, dbs = run.dbs;
+  const sized = dbs.filter(d => d.sizeGb != null);
+  const gb = sized.length ? sum(sized.map(d => d.sizeGb)) : null;
+  const full = run.appsHit.filter(a => a.full).length;
+  const nullRestores = run.steps.filter(s => s.kind === 'restore' && s.minutes === null).length;
+  const nullBuildEnvs = uniq(run.steps.filter(s => s.kind === 'rebuild' && s.minutes === null).map(s => envBucket(s.leg.inst.environment)));
+  const emptyLegs = run.legs.filter(l => l.work.total === null).length;
+
+  const totalSub = run.total !== null
+    ? (nullRestores ? `Leaves out ${plural(nullRestores, 'NULL restore')}, so the real figure is higher` : 'One step at a time, the longest it takes')
+    : (run.vm && run.vm.minutes === null) ? `${envBucket(run.vm.environment)} VM build hours are NULL`
+    : (nullBuildEnvs.length ? `${nullBuildEnvs.join(', ')} SQL rebuild hours are NULL` : `${plural(emptyLegs, 'instance')} with no restore figure at all`);
+
+  const kpis = [
+    ['Time to recover', fmtH(run.total), esc(totalSub), spec.colour],
+    ['Databases restored', dbs.length, spreadHtml(dbs), 'var(--info)'],
+    ['Data to restore', fmtGb(gb), gb === null ? 'No size captured yet' : `across ${plural(sized.length, 'sized database')}`, 'var(--accent)'],
+    ['Applications affected', run.appsHit.length, run.appsHit.length ? `${full} completely, ${run.appsHit.length - full} partly` : 'None recorded', 'var(--high)']
+  ].map(kpiHtml).join('');
+
+  /* The timeline. Each bar starts where the one before it ended. */
+  const scale = Math.max(run.clock, 1);
+  const pct = m => (m / scale * 100).toFixed(2);
+  let stepNo = 0;
+  const assumption = (s, source) => ({
+    sub: s.minutes === null ? `${esc(source)} are NULL. Enter them on the Framework panel.` : `${esc(source)}, set on the Framework panel`,
+    basis: s.minutes === null ? '<span class="badge b-none">NULL</span>' : '<span class="badge b-assume">Assumption</span>'
+  });
+  const stepRow = s => {
+    stepNo++;
+    let colour, what, sub, basis;
+    if (s.kind === 'restore') {
+      const d = s.db;
+      colour = BASIS_HEX[s.r.basis];
+      what = `${RESTORE_VERB[fam]} ${dbName(d)}${d.shared ? `<span class="shared-tag">used by ${d.apps.length} apps</span>` : ''}`;
+      sub = (s.r.basis === 'derived' ? '' : `${esc(gbText(d.sizeGb))} &middot; `) + esc(s.r.detail);
+      basis = basisBadge(s.r);
+    } else if (s.kind === 'vm') {
+      colour = 'var(--med)';
+      what = `Build the replacement VM <b>${esc(s.vm.name)}</b>`;
+      ({ sub, basis } = assumption(s, `${envBucket(s.vm.environment)} VM build hours`));
+    } else if (s.kind === 'rebuild') {
+      colour = 'var(--high)';
+      what = 'Install and configure SQL Server to the point a restore can start';
+      ({ sub, basis } = assumption(s, `${envBucket(s.leg.inst.environment)} SQL rebuild hours`));
+    } else {
+      colour = 'var(--brand)';
+      what = 'Validate, reconnect the applications and hand over';
+      ({ sub, basis } = assumption(s, 'Validation hours'));
+    }
+    const bar = s.minutes === null
+      ? `<i class="nullbar" style="left:calc(${pct(s.start)}% - ${(s.start / scale * 12).toFixed(1)}px)"></i>`
+      : `<i style="left:${pct(s.start)}%;width:${pct(s.minutes)}%"></i>`;
+    return `<tr>
+      <td class="num mono">${stepNo}</td>
+      <td><span class="step-kind" style="--k-c:${colour}">${STEP_LABEL[s.kind]}</span>${what}<div class="note">${sub}</div></td>
+      <td class="num mono"><b>${fmtH(s.minutes)}</b></td>
+      <td>${basis}</td>
+      <td class="clock">T+ ${clockText(s.end)}${s.open ? ' <span class="nul">+ NULL</span>' : ''}</td>
+      <td><div class="track" style="--k-c:${colour}">${bar}</div></td></tr>`;
+  };
+  const vmRows = run.vm
+    ? `<tr class="leg"><td colspan="6">VM ${esc(run.vm.name)} ${envTag(run.vm.environment)} &nbsp;&middot;&nbsp; carries ${plural(run.legs.length, 'SQL instance')}</td></tr>`
+      + run.steps.filter(s => s.kind === 'vm').map(stepRow).join('')
+    : '';
+  const rows = vmRows + run.legs.map(leg => {
+    const inst = leg.inst;
+    const head = `<tr class="leg"><td colspan="6">${esc(inst.instance)} ${envTag(inst.environment)} &nbsp;&middot;&nbsp; VM ${nz(inst.server)} &nbsp;&middot;&nbsp; ${plural(leg.dbs.length, 'database')} &nbsp;&middot;&nbsp; this instance ${fmtH(leg.total)}</td></tr>`;
+    return head + run.steps.filter(s => s.leg === leg).map(stepRow).join('');
+  }).join('');
+  const counted = run.steps.filter(s => s.minutes !== null).length;
+
+  /* Who is down. */
+  const appsHtml = run.appsHit.length
+    ? `<div class="apps-hit">${run.appsHit.map(a => `<button type="button" class="app-hit ${a.full ? 'full' : ''}" data-goapp="${esc(a.name)}" title="Open ${esc(a.name)} on the Application Overview"><b>${esc(a.name)}</b><span>${a.full ? `all ${plural(a.of, 'database')}` : `${a.hit} of ${a.of} databases`}</span></button>`).join('')}</div>`
+    : '<p class="note">No application is recorded against these databases.</p>';
+  const collateralHtml = run.kind === 'app-lost' && ctx.collateral.length
+    ? `<p class="note" style="margin-top:9px">Sharing these instances but not restored here: ${esc(nameList(ctx.collateral, 8))}. If an instance itself has gone, run it as an instance scenario: `
+      + run.legs.map(l => `<button type="button" class="link" data-goinst="${esc(l.inst.instance)}" data-kind="inst-lost">${esc(l.inst.instance)}</button> ${envTag(l.inst.environment)}`).join(' &nbsp; ') + '</p>'
+    : '';
+
+  /* What the evidence says. A note that applies to every row is said once, above the table. */
+  const cols = CHECK_COLS[fam];
+  const showInst = run.legs.length > 1;
+  const perDb = run.legs.flatMap(l => l.dbs).map(d => ({ d, f: scenarioFindings(fam, d) }));
+  const fkey = f => f.join('|');
+  const common = perDb.length > 1 ? perDb[0].f.filter(f => perDb.every(x => x.f.some(g => fkey(g) === fkey(f)))) : [];
+  const commonKeys = new Set(common.map(fkey));
+  const verdict = f => `<span class="verdict v-${f[0]}">${esc(f[1])}</span>`;
+  const own = perDb.map(x => x.f.filter(f => !commonKeys.has(fkey(f))));
+  const showNotes = own.some(list => list.length);
+  const checkRows = perDb.map(({ d }, i) => `<tr>
+      <td><b>${esc(d.database)}</b> ${envTag(d.environment)}</td>
+      ${showInst ? `<td>${esc(d.instance)} ${envTag(instances.get(d.instance).environment)}</td>` : ''}
+      ${cols.map(c => `<td class="${CHECK_CELLS[c][2]}">${CHECK_CELLS[c][1](d)}</td>`).join('')}
+      ${showNotes ? `<td style="min-width:260px">${own[i].map(verdict).join('')}</td>` : ''}</tr>`).join('');
+  const commonHtml = common.length
+    ? `<div class="callout" style="margin:0 0 10px;background:#fff"><b>Applies to every database here</b>${common.map(verdict).join('')}</div>` : '';
+
+  const remedies = scenarioRemedies(run);
+  const gaps = scenarioGaps(run, ctx);
+
+  return `
+    <div class="scn-story" style="--scn-c:${spec.colour}">${scenarioStory(run, ctx)}</div>
+    <div class="grid4">${kpis}</div>
+
+    <div class="scn-h">Step by step, one at a time</div>
+    <div class="tbl-wrap" style="max-height:440px"><table class="table scn-steps">
+      <thead><tr><th class="num">#</th><th>Step</th><th class="num">Duration</th><th>Basis</th><th class="num">Clock after</th><th>Timeline</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    <p class="note" style="margin-top:7px">${counted} of ${run.steps.length} steps have a figure. The clock adds up only those; <span class="nul">+ NULL</span> means a step with no figure has already been passed.</p>
+
+    <div class="scn-h">Applications affected</div>
+    ${appsHtml}${collateralHtml}
+
+    <div class="scn-h">What the evidence says about this failure</div>
+    ${commonHtml}
+    <div class="tbl-wrap" style="max-height:340px"><table class="table">
+      <thead><tr><th>Database</th>${showInst ? '<th>SQL instance</th>' : ''}${cols.map(c => `<th class="${CHECK_CELLS[c][2].includes('num') ? 'num' : ''}">${CHECK_CELLS[c][0]}</th>`).join('')}${showNotes ? '<th>What it means here</th>' : ''}</tr></thead>
+      <tbody>${checkRows}</tbody></table></div>
+
+    <div class="grid2" style="margin-top:14px">
+      <div class="card" style="--accent-c:var(--accent)"><b class="h">Ways to bring this down</b>
+        ${remedies.length ? `<ul class="scn-list">${remedies.map(x => `<li>${x}</li>`).join('')}</ul>` : '<p>Nothing in the collected evidence points to a shorter path.</p>'}</div>
+      <div class="card" style="--accent-c:var(--med)"><b class="h">Not counted in this figure</b>
+        <ul class="scn-list">${gaps.map(x => `<li>${x}</li>`).join('')}</ul></div>
+    </div>`;
+}
+
+/* One scenario block: the drop-down, a database picker when the failure is database-level,
+   and the run-down. Returns a redraw function so the relationship map can drive it too. */
+function scenarioControlsHtml(o) {
+  const spec = SCENARIOS[o.state.kind];
+  const options = o.kinds.map(k => `<option value="${k}"${k === o.state.kind ? ' selected' : ''}>${esc(SCENARIOS[k].label)}</option>`).join('');
+  let picker = '';
+  if (!spec.rebuild) {
+    const mixed = o.pool.some(d => isProd(d.environment)) && o.pool.some(d => !isProd(d.environment));
+    picker = `<div class="scn-picker">
+      <div class="ph"><span data-count></span>
+        <span class="acts"><button type="button" class="link" data-pick="all">Tick all</button>${mixed ? '<button type="button" class="link" data-pick="prod">Production only</button>' : ''}<button type="button" class="link" data-pick="none">Clear</button></span></div>
+      <div class="pb">${groupByInstance(o.pool).map(([inst, list]) =>
+        (o.grouped ? `<div class="scn-group">${esc(inst.instance)} ${envTag(inst.environment)}</div>` : '')
+        + list.map(d => `<label class="scn-opt"><input type="checkbox" data-key="${esc(d.key)}"${o.state.picked.has(d.key) ? ' checked' : ''}>
+            <span>${dbName(d)}${d.shared ? `<span class="shared-tag">used by ${d.apps.length} apps</span>` : ''}</span>
+            <span class="f">${esc(gbText(d.sizeGb))}</span><span class="f">${esc(hoursText(restoreOf(d).minutes))}</span></label>`).join('')).join('')}</div>
+    </div>`;
+  }
+  return `<div class="scn-bar"><label>Scenario<select class="search" data-scn aria-label="Scenario">${options}</select></label>
+    <div class="scn-what">${esc(spec.what)}</div></div>${picker}`;
+}
+
+function mountScenario(o) {
+  const drawResult = () => {
+    const spec = SCENARIOS[o.state.kind];
+    const counter = o.controls.querySelector('[data-count]');
+    const ticked = o.pool.filter(d => o.state.picked.has(d.key));
+    if (counter) counter.innerHTML = `<b>${ticked.length}</b> of ${o.pool.length} databases ticked${ticked.length ? ' &nbsp;&middot;&nbsp; ' + spreadHtml(ticked) : ''}`;
+    const dbs = spec.rebuild ? o.scope(o.state.kind) : ticked;
+    if (!dbs.length) {
+      o.result.innerHTML = `<div class="empty">${spec.rebuild ? 'Nothing is in scope for this filter.' : 'Tick at least one database to run this scenario.'}</div>`;
+    } else {
+      o.result.innerHTML = scenarioResultHtml(runScenario(o.state.kind, dbs), o.ctx);
+      wireScenarioLinks(o.result);
+    }
+    if (o.after) o.after();
+  };
+  const draw = () => {
+    const body = o.controls.querySelector('.pb');
+    const scroll = body ? body.scrollTop : 0;
+    o.controls.innerHTML = scenarioControlsHtml(o);
+    const fresh = o.controls.querySelector('.pb');
+    if (fresh) fresh.scrollTop = scroll;
+    o.controls.querySelector('[data-scn]').onchange = e => { o.state.kind = e.target.value; draw(); };
+    o.controls.querySelectorAll('input[data-key]').forEach(cb => cb.onchange = () => {
+      if (cb.checked) o.state.picked.add(cb.dataset.key); else o.state.picked.delete(cb.dataset.key);
+      drawResult();
+    });
+    o.controls.querySelectorAll('[data-pick]').forEach(b => b.onclick = () => {
+      o.state.picked.clear();
+      o.pool.forEach(d => { if (b.dataset.pick === 'all' || (b.dataset.pick === 'prod' && isProd(d.environment))) o.state.picked.add(d.key); });
+      draw();
+    });
+    drawResult();
+  };
+  draw();
+  return draw;
+}
+
+function wireScenarioLinks(root) {
+  root.querySelectorAll('[data-goapp]').forEach(b => b.onclick = () => {
+    selectedApp = b.dataset.goapp;
+    document.getElementById('envFilter').value = 'ALL';
+    renderAppList(); renderApp(); showView('appView');
+  });
+  root.querySelectorAll('[data-goinst]').forEach(b => b.onclick = () => openInstance(b.dataset.goinst, b.dataset.kind || null));
+}
+
+const appScn = { kind: 'app-lost', picked: new Set(), scope: null, draw: null };
+const instScn = { kind: 'inst-lost', picked: new Set(), scope: null, draw: null };
+
+/* ---------------------------------------------------------------------------
+   Header
+--------------------------------------------------------------------------- */
+function renderGlobal() {
+  const stats = [
+    ['Applications', applications.size],
+    ['SQL instances', instances.size],
+    ['Databases', databases.size],
+    ['Production instances', [...instances.values()].filter(i => isProd(i.environment)).length]
+  ];
+  document.getElementById('globalStats').innerHTML = stats
+    .map(([l, v]) => `<div class="top-stat"><b>${esc(v)}</b><span>${esc(l)}</span></div>`).join('');
+}
+
+/* ---------------------------------------------------------------------------
+   Application overview
+--------------------------------------------------------------------------- */
+let selectedApp = [...applications.keys()].sort(byName)[0] || null;
+
+function renderAppList() {
+  const q = (document.getElementById('appSearch').value || '').trim().toLowerCase();
+  const names = [...applications.keys()].sort(byName).filter(n => n.toLowerCase().includes(q));
+  document.getElementById('appList').innerHTML = names.length ? names.map(n => {
+    const a = applications.get(n);
+    return `<button class="app-btn ${n === selectedApp ? 'active' : ''}" data-app="${esc(n)}">
+      <b>${esc(n)}</b>
+      <span class="s">${uniq(a.dbs.map(d => d.instance)).length} SQL instances &middot; ${a.dbs.length} databases</span>
+      ${spreadHtml(a.dbs)}</button>`;
+  }).join('') : '<div class="empty">No applications match.</div>';
+  document.querySelectorAll('#appList [data-app]').forEach(b => b.onclick = () => {
+    selectedApp = b.dataset.app;
+    document.getElementById('envFilter').value = 'ALL';
+    renderAppList(); renderApp();
+  });
+}
+
+function renderApp() {
+  if (!selectedApp) return;
+  const app = applications.get(selectedApp);
+  const filter = document.getElementById('envFilter');
+
+  const envs = uniq(app.rows.map(r => r.environment)).sort((a, b) => envRank(a) - envRank(b));
+  const current = filter.value;
+  filter.innerHTML = '<option value="ALL">All environments</option>' +
+    envs.map(e => `<option value="${esc(e)}">${esc(e)}</option>`).join('');
+  filter.value = envs.includes(current) ? current : 'ALL';
+
+  const m = applicationMttr(app, filter.value);
+  const sized = m.dbs.filter(d => d.sizeGb != null);
+  const gb = sized.length ? sum(sized.map(d => d.sizeGb)) : null;
+
+  document.getElementById('appTitle').textContent = app.name;
+  document.getElementById('appSubtitle').innerHTML =
+    `${envs.map(envTag).join(' ')} &nbsp;&middot;&nbsp; ${m.legs.length} SQL instances &nbsp;&middot;&nbsp; ${m.dbs.length} databases`
+    + (m.collateral.length ? ` &nbsp;&middot;&nbsp; shares infrastructure with <b>${m.collateral.length}</b> other application${m.collateral.length === 1 ? '' : 's'}` : '');
+
+  document.getElementById('appKpis').innerHTML = [
+    ['Databases in scope', m.dbs.length, m.dbs.length ? spreadHtml(m.dbs) : 'None in this filter', 'var(--info)'],
+    ['SQL instances', m.legs.length, m.collateral.length ? `${m.collateral.length} other applications on the same hosts` : 'No other application shares these hosts', 'var(--accent)']
+  ].map(kpiHtml).join('');
+
+  const details = applicationDetails.filter(x => x.application === selectedApp);
+  const box = document.getElementById('appDetails');
+  if (details.length) {
+    box.innerHTML = details.map(x => `<div><b>${esc(x.sheet)}</b> &mdash; ` + x.fields
+      .map(f => `${esc(f.label)}: <b>${f.isNull ? NUL : esc(f.value)}</b>`).join(' &middot; ') + '</div>').join('');
+    box.classList.remove('hidden');
+  } else { box.classList.add('hidden'); }
+
+  const quantified = m.mix.measured + m.mix.derived;
+  document.getElementById('appNote').innerHTML = m.dbs.length
+    ? `${quantified} of ${m.dbs.length} databases have a restore figure behind them`
+      + (m.mix.none
+          ? `; the other ${m.mix.none} ${m.mix.none === 1 ? 'is' : 'are'} NULL and excluded from the MTTR above, so the real figure is higher until they are collected.`
+          : `. Every database in scope is quantified.`)
+    : '';
+
+  /* The scenario keeps its ticks while the application and filter stay the same. */
+  const pool = groupByInstance(m.dbs).flatMap(([, list]) => list);
+  const scope = `${app.name}|${filter.value}`;
+  if (appScn.scope !== scope) { appScn.scope = scope; appScn.picked = new Set(defaultPick(pool)); }
+  appScn.draw = mountScenario({
+    controls: document.getElementById('appScnControls'),
+    result: document.getElementById('appScnResult'),
+    kinds: APP_SCENARIOS, state: appScn, pool, grouped: true,
+    scope: () => pool,
+    ctx: { app, filter: filter.value, collateral: m.collateral },
+    after: () => renderAppTopology(app, m)
+  });
+  renderAppEnvironments(app, m, filter.value);
+}
+
+/* The relationship map: application, environment, SQL instance, databases. */
+function renderAppTopology(app, m) {
+  const el = document.getElementById('appTopo');
+  const legendEl = document.getElementById('appTopoLegend');
+
+  if (!m.legs.length) {
+    el.innerHTML = '<div class="empty">No databases for this filter.</div>';
+    legendEl.innerHTML = '';
+    return;
+  }
+
+  const byEnv = new Map();
+  m.legs.forEach(leg => {
+    const e = leg.instance.environment;
+    if (!byEnv.has(e)) byEnv.set(e, []);
+    byEnv.get(e).push(leg);
+  });
+
+  /* With a database-level scenario picked, the map is also a picker: ticked databases are
+     ringed, the rest recede, and clicking a database adds it or takes it out. */
+  const picking = !SCENARIOS[appScn.kind].rebuild;
+  el.classList.toggle('scn-pick', picking && appScn.picked.size > 0);
+
+  const cards = [...byEnv.entries()].sort((a, b) => envRank(a[0]) - envRank(b[0])).map(([environment, legs]) => {
+    const envDbs = legs.flatMap(l => l.dbs);
+    const totals = legs.map(l => l.total).filter(t => t !== null);
+    const envTotal = totals.length === legs.length ? sum(totals) : null;
+
+    const stack = legs.slice().sort((a, b) => byName(a.instance.instance, b.instance.instance)).map(leg => {
+      const inst = leg.instance;
+      const release = versionLabel(inst.meta);
+      const chips = leg.dbs.map(d => {
+        const r = restoreOf(d);
+        const tip = `${d.database} (${d.environment}) on ${d.instance}\n${gbText(d.sizeGb)} \u00b7 restore ${hoursText(r.minutes)} \u00b7 ${r.label}\n${r.detail}`
+                  + (picking ? `\nClick to ${appScn.picked.has(d.key) ? 'take it out of' : 'add it to'} the scenario` : '');
+        const inner = `<b>${esc(d.database)}</b><span>${esc(hoursText(r.minutes))}</span>`;
+        return picking
+          ? `<button type="button" class="dbchip ${appScn.picked.has(d.key) ? 'hit' : ''}" data-dbkey="${esc(d.key)}" style="--basis-c:${BASIS_HEX[r.basis]}" title="${esc(tip)}">${inner}</button>`
+          : `<span class="dbchip" style="--basis-c:${BASIS_HEX[r.basis]}" title="${esc(tip)}">${inner}</span>`;
+      }).join('');
+
+      return `<div class="inst-node">
+        <div class="inst-top">
+          <div style="min-width:0">
+            <button class="inst-link" data-instance="${esc(inst.instance)}">${esc(inst.instance)}</button> ${envTag(inst.environment)}
+            <div class="inst-meta">Host ${nz(inst.server)} &middot; ${release ? esc(release) : NUL}${inst.siblings ? ` &middot; ${inst.siblings} other instance${inst.siblings === 1 ? '' : 's'} on this host` : ''}</div>
+          </div>
+          <div class="inst-fig"><b>${leg.dbs.length}</b> databases<br><b>${fmtH(leg.total)}</b> this leg</div>
+        </div>
+        <div class="dbchips">${chips}</div>
+      </div>`;
+    }).join('');
+
+    return `<div class="env-card" style="--env-c:${envHex(environment)}">
+      <div class="eh">
+        <div class="env-circle">${esc(environment)}</div>
+        <div class="env-sum">
+          <b>${legs.length} SQL instance${legs.length === 1 ? '' : 's'}</b>
+          <span>${envDbs.length} database${envDbs.length === 1 ? '' : 's'} &middot; ${hoursText(envTotal)} to recover this environment</span>
+        </div>
+      </div>
+      <div class="inst-stack">${stack}</div>
+    </div>`;
+  }).join('');
+
+  el.innerHTML = `<div class="flow-root"><div class="root-circle">
+      <b>${esc(app.name)}</b>
+      <span>${m.dbs.length} database${m.dbs.length === 1 ? '' : 's'}<br>${m.legs.length} SQL instance${m.legs.length === 1 ? '' : 's'}<br>${esc(spreadText(m.dbs))}</span>
+    </div></div>
+    <div class="pointer-line"></div>
+    <div class="env-grid">${cards}</div>`;
+
+  el.querySelectorAll('[data-instance]').forEach(b => b.onclick = () => openInstance(b.dataset.instance, null));
+  el.querySelectorAll('[data-dbkey]').forEach(b => b.onclick = () => {
+    const key = b.dataset.dbkey;
+    if (appScn.picked.has(key)) appScn.picked.delete(key); else appScn.picked.add(key);
+    appScn.draw();
+  });
+
+  legendEl.innerHTML =
+    envCounts(m.dbs).map(([e, n]) => `<span><i class="sw" style="background:${envHex(e)}"></i>${esc(e)} ${n}</span>`).join('')
+    + `<span style="margin-left:14px"><i class="rd" style="background:${BASIS_HEX.measured}"></i>measured</span>`
+    + `<span><i class="rd" style="background:${BASIS_HEX.derived}"></i>derived</span>`
+    + `<span><i class="rd" style="background:${BASIS_HEX.none}"></i>NULL</span>`
+    + (picking ? `<span style="margin-left:14px"><i class="sw" style="background:var(--crit-bg);box-shadow:0 0 0 2px var(--crit)"></i>in the scenario: ${appScn.picked.size}</span>` : '')
+    + `<span style="margin-left:auto;color:var(--ink3)">The coloured edge of each database is the basis of its restore time.</span>`;
+}
+
+function openInstance(name, kind) {
+  selectedInstance = name;
+  if (kind) instScn.kind = kind;
+  renderInstanceList();
+  renderInstanceDetail();
+  showView('serverView');
+}
+
+/* Environment by environment, then instance by instance, then the databases inside. */
+function renderAppEnvironments(app, m, filterValue) {
+  const byEnv = new Map();
+  m.legs.forEach(leg => {
+    const e = leg.instance.environment;
+    if (!byEnv.has(e)) byEnv.set(e, []);
+    byEnv.get(e).push(leg);
+  });
+
+  const blocks = [...byEnv.entries()].sort((a, b) => envRank(a[0]) - envRank(b[0])).map(([environment, legs]) => {
+    const dbCount = sum(legs.map(l => l.dbs.length));
+    const totals = legs.map(l => l.total).filter(t => t !== null);
+    const envTotal = totals.length === legs.length ? sum(totals) : null;
+    const sizedDbs = legs.flatMap(l => l.dbs).filter(d => d.sizeGb != null);
+    const gb = sizedDbs.length ? sum(sizedDbs.map(d => d.sizeGb)) : null;
+
+    const instanceRows = legs.slice().sort((a, b) => byName(a.instance.instance, b.instance.instance)).map(leg => {
+      const inst = leg.instance;
+      const shared = inst.appList.filter(a => a !== app.name);
+      const mechanisms = uniq(leg.dbs.map(d => d.mechanism).filter(Boolean));
+
+      return `<details class="inst">
+        <summary>
+          <span><span class="inst-name">${esc(inst.instance)}</span> ${envTag(inst.environment)}
+            <div class="inst-sub">Host ${nz(inst.server)}${inst.siblings ? ` &middot; ${inst.siblings} other instance${inst.siblings === 1 ? '' : 's'} on this host` : ''} &middot; ${mechanisms.length ? esc(mechanisms.join(', ')) : NUL + ' replication / HA'}</div></span>
+          <span class="inst-figs">
+            <span><b>${leg.dbs.length}</b>databases</span>
+            <span><b>${fmtH(leg.work.total)}</b>restore</span>
+            <span><b>${fmtH(leg.total)}</b>this leg</span>
+          </span>
+        </summary>
+        <div class="inst-body">
+          <div class="meta" style="grid-template-columns:repeat(3,1fr)">
+            <div class="meta-box"><b>SQL rebuild</b><span>${fmtH(leg.buildMinutes)}</span></div>
+            <div class="meta-box"><b>SQL version</b><span>${nz(versionFull(inst.meta))}</span></div>
+            <div class="meta-box"><b>Other applications here</b><span>${shared.length ? esc(shared.join(', ')) : 'None'}</span></div>
+          </div>
+          <div class="tbl-wrap"><table class="table">
+            <thead><tr><th>Database</th><th class="num">Size</th><th>Replication / HA</th><th>Last backup</th><th class="num">Restore time</th><th>Basis</th></tr></thead>
+            <tbody>${leg.dbs.map(d => {
+              const r = restoreOf(d);
+              return `<tr>
+                <td><b>${esc(d.database)}</b> ${envTag(d.environment)}</td>
+                <td class="num mono">${fmtGb(d.sizeGb)}</td>
+                <td>${nz(d.mechanism)}</td>
+                <td class="mono">${nz(d.lastFullBackup)}</td>
+                <td class="num mono"><b>${fmtH(r.minutes)}</b></td>
+                <td>${basisBadge(r)}</td></tr>`;
+            }).join('')}</tbody></table></div>
+          ${leg.work.unquantified ? `<p class="note" style="margin-top:8px">${leg.work.unquantified} database${leg.work.unquantified === 1 ? ' is' : 's are'} NULL and excluded from this leg.</p>` : ''}
+        </div>
+      </details>`;
+    }).join('');
+
+    return `<div class="env-block">
+      <div class="env-head">
+        <span class="l">${envTag(environment)} <b style="color:var(--brand);font-size:13px">${legs.length} SQL instance${legs.length === 1 ? '' : 's'}</b></span>
+        <span class="figs">
+          <span><b>${dbCount}</b>databases</span>
+          <span><b>${fmtGb(gb)}</b>data</span>
+          <span><b>${fmtH(envTotal)}</b>environment MTTR</span>
+        </span>
+      </div>${instanceRows}</div>`;
+  }).join('');
+
+  document.getElementById('appEnvironments').innerHTML = blocks ||
+    `<div class="panel pad"><div class="empty">No databases for this application in ${esc(filterValue)}.</div></div>`;
+}
+
+/* ---------------------------------------------------------------------------
+   SQL instance MTTR - every database on one instance
+--------------------------------------------------------------------------- */
+let selectedInstance = [...instances.keys()].sort(byName)[0] || null;
+
+function renderInstanceList() {
+  const q = (document.getElementById('srvSearch').value || '').trim().toLowerCase();
+  const list = [...instances.values()]
+    .filter(i => i.instance.toLowerCase().includes(q))
+    .sort((a, b) => byName(a.instance, b.instance));
+  document.getElementById('srvList').innerHTML = list.length ? list.map(i => {
+    const release = versionLabel(i.meta);
+    return `<button class="srv-btn ${i.instance === selectedInstance ? 'active' : ''}" data-instance="${esc(i.instance)}">
+      <b>${esc(i.instance)}</b> ${envTag(i.environment)}
+      <span class="s">${i.databases.length} database${i.databases.length === 1 ? '' : 's'} &middot; ${release ? esc(release) : NUL}${i.siblings ? `<br>shares host with ${i.siblings} other instance${i.siblings === 1 ? '' : 's'}` : ''}</span>
+    </button>`;
+  }).join('') : '<div class="empty">No SQL instances match.</div>';
+  document.querySelectorAll('#srvList [data-instance]').forEach(b => b.onclick = () => {
+    selectedInstance = b.dataset.instance; renderInstanceList(); renderInstanceDetail();
+  });
+}
+
+function renderInstanceDetail() {
+  if (!selectedInstance) return;
+  const inst = instances.get(selectedInstance);
+  const m = instanceMttr(inst);
+  const meta = inst.meta;
+  const mechanisms = uniq(inst.databases.map(d => d.mechanism).filter(Boolean));
+  const sized = inst.databases.filter(d => d.sizeGb != null);
+  const gb = sized.length ? sum(sized.map(d => d.sizeGb)) : null;
+  const connectivity = (inst.databases[0] && inst.databases[0].connectivity) || 'Not tested';
+  const link = (url, label) => url ? `<a class="link" target="_blank" rel="noopener" href="${esc(url)}">${esc(label)}</a>` : NUL;
+
+  document.getElementById('srvDetail').innerHTML = `
+    <h2 class="sec">${esc(inst.instance)} ${envTag(inst.environment)}</h2>
+    <p class="note">Every database on this instance, restored one at a time, plus the rebuild of the instance itself.${inst.siblings ? ` This host also carries ${inst.siblings} other SQL instance${inst.siblings === 1 ? '' : 's'}.` : ''}</p>
+
+    <div class="grid4" style="margin-top:14px">${[
+      ['Complete instance MTTR', fmtH(m.complete), 'Rebuild + every database + validation', 'var(--crit)'],
+      ['SQL rebuild', fmtH(m.buildMinutes), `${esc(envBucket(inst.environment))} assumption`, 'var(--high)'],
+      ['Restore workload', fmtH(m.total), `${m.counted} of ${inst.databases.length} databases have a figure`, 'var(--info)'],
+      ['Databases on this instance', inst.databases.length, gb === null ? 'No size captured yet' : `${gbText(gb)} in total`, 'var(--accent)']
+    ].map(kpiHtml).join('')}</div>
+
+    <div class="meta">
+      <div class="meta-box"><b>Host</b><span>${nz(inst.server)}</span></div>
+      <div class="meta-box"><b>SQL version</b><span>${nz(versionFull(meta))}</span></div>
+      <div class="meta-box"><b>Edition</b><span>${nz(meta && meta.edition ? meta.edition : null)}</span></div>
+      <div class="meta-box"><b>Connectivity</b><span><span class="status ${slug(connectivity)}">${esc(connectivity)}</span></span></div>
+      <div class="meta-box"><b>Replication / HA design</b><span>${mechanisms.length ? esc(mechanisms.join(', ')) : NUL}</span></div>
+      <div class="meta-box"><b>Evidence collection</b><span>${nz(meta ? meta.status : null)}${meta && meta.message ? `<div class="note">${esc(meta.message)}</div>` : ''}</span></div>
+      <div class="meta-box"><b>Runbooks</b><span>${link(cfg.buildDoc, 'Build')} &middot; ${link(cfg.drDoc, 'DR')} &middot; ${link(cfg.lifecycle, 'Lifecycle')}</span></div>
+      <div class="meta-box"><b>NULL restore times</b><span>${m.unquantified} of ${inst.databases.length}${m.unquantified ? ' &mdash; the figure above is lower than the truth' : ''}</span></div>
+    </div>
+
+    <h3 class="sec">Scenario run-down</h3>
+    <p class="note" style="margin:-2px 0 12px">Pick a failure on this instance and walk the recovery step by step.</p>
+    <div id="srvScnControls"></div>
+    <div id="srvScnResult"></div>
+
+    <h3 class="sec">Every database on this instance</h3>
+    <div class="tbl-wrap"><table class="table">
+      <thead><tr><th>Database</th><th class="num">Size</th><th>Compatibility</th><th>Recovery model</th><th>Replication / HA</th><th>Last backup</th><th>Last restore</th><th class="num">Restore time</th><th>Basis</th></tr></thead>
+      <tbody>${inst.databases.map(d => {
+        const r = restoreOf(d);
+        return `<tr>
+          <td><b>${esc(d.database)}</b> ${envTag(d.environment)}${d.state && d.state !== 'ONLINE' ? ` <span class="badge b-crit">${esc(d.state)}</span>` : ''}</td>
+          <td class="num mono">${fmtGb(d.sizeGb)}</td>
+          <td>${nz(compatLabel(d.compatibility))}</td>
+          <td>${nz(d.recoveryModel)}</td>
+          <td>${nz(d.mechanism)}</td>
+          <td class="mono">${nz(d.lastFullBackup)}${d.backupThroughputMBs != null ? `<div class="note">${d.backupThroughputMBs} MB/s measured</div>` : ''}</td>
+          <td class="mono">${nz(d.lastRestore)}</td>
+          <td class="num mono"><b>${fmtH(r.minutes)}</b></td>
+          <td>${basisBadge(r)}</td></tr>`;
+      }).join('')}</tbody></table></div>
+    <p class="note" style="margin-top:9px">Databases are listed by name. Hover any basis badge to see exactly how that figure was arrived at.</p>`;
+
+  if (!INSTANCE_SCENARIOS.includes(instScn.kind)) instScn.kind = 'inst-lost';
+  if (instScn.scope !== inst.instance) { instScn.scope = inst.instance; instScn.picked = new Set(defaultPick(inst.databases)); }
+  const vmKey = String(inst.server || '').toUpperCase();
+  const onVm = [...instances.values()].filter(i => String(i.server || '').toUpperCase() === vmKey);
+  instScn.draw = mountScenario({
+    controls: document.getElementById('srvScnControls'),
+    result: document.getElementById('srvScnResult'),
+    kinds: INSTANCE_SCENARIOS, state: instScn, pool: inst.databases, grouped: false,
+    scope: kind => kind === 'vm-lost' ? onVm.flatMap(i => i.databases) : inst.databases,
+    ctx: { inst }
+  });
+}
+
+/* ---------------------------------------------------------------------------
+   Executive deck - in working. It says what this is, and no more.
+--------------------------------------------------------------------------- */
+function renderDeck() {
+  const allDbs = [...databases.values()];
+  const sized = allDbs.filter(d => d.sizeGb != null);
+  const totalGb = sized.length ? sum(sized.map(d => d.sizeGb)) : null;
+  const withFigure = allDbs.filter(d => restoreOf(d).minutes !== null).length;
+
+  const instList = [...instances.values()].map(i => ({ inst: i, m: instanceMttr(i) }));
+  const quantified = instList.filter(x => x.m.complete !== null);
+  const worstInstance = quantified.slice().sort((a, b) => b.m.complete - a.m.complete)[0] || null;
+
+  const appList = [...applications.values()].map(a => ({ app: a, m: applicationMttr(a, 'ALL') }));
+  const worstApp = appList.filter(x => x.m.complete !== null).sort((a, b) => b.m.complete - a.m.complete)[0] || null;
+
+  const dbTimes = allDbs.map(d => ({ db: d, r: restoreOf(d) })).filter(x => x.r.minutes !== null);
+  const worstDb = dbTimes.slice().sort((a, b) => b.r.minutes - a.r.minutes)[0] || null;
+  const medianDb = dbTimes.length
+    ? dbTimes.slice().sort((a, b) => a.r.minutes - b.r.minutes)[Math.floor(dbTimes.length / 2)] : null;
+
+  document.getElementById('deckLead').textContent =
+    `${applications.size} applications run on ${instances.size} SQL instances holding ${databases.size} databases `
+    + `(${spreadText(allDbs)}). This is what it currently takes to bring each of those back, one database at a time. `
+    + `${withFigure} of ${databases.size} databases have a restore figure behind them; the rest are NULL until they are collected.`;
+
+  document.getElementById('deckKpis').innerHTML = [
+    ['Applications in scope', applications.size, `${[...instances.values()].filter(i => i.appList.length > 1).length} SQL instances carry more than one`, 'var(--accent)'],
+    ['Databases to recover', databases.size, spreadHtml(allDbs), 'var(--info)'],
+    ['Longest single instance loss', worstInstance ? fmtH(worstInstance.m.complete) : NUL,
+      worstInstance ? esc(worstInstance.inst.instance) : 'Enter the rebuild hours on the Framework panel', 'var(--crit)'],
+    ['Production instances', [...instances.values()].filter(i => isProd(i.environment)).length, `of ${instances.size} total`, 'var(--high)']
+  ].map(kpiHtml).join('');
+
+  const scenarios = [
+    { h: '1 &middot; A database is lost',
+      big: medianDb ? fmtH(medianDb.r.minutes) : NUL,
+      who: medianDb
+        ? `Typical database. The longest is <b>${esc(worstDb.db.database)}</b> ${envTag(worstDb.db.environment)} at <b>${hoursText(worstDb.r.minutes)}</b>.`
+        : 'No database has a restore time yet. Run collection to measure them.' },
+    { h: '2 &middot; An application is lost',
+      big: worstApp ? fmtH(worstApp.m.complete) : NUL,
+      who: worstApp
+        ? `Worst case is <b>${esc(worstApp.app.name)}</b>, across ${worstApp.m.legs.length} instance${worstApp.m.legs.length === 1 ? '' : 's'}.`
+        : 'Enter the SQL rebuild hours on the Framework panel to quantify this scenario.' },
+    { h: '3 &middot; A SQL instance is lost',
+      big: worstInstance ? fmtH(worstInstance.m.complete) : NUL,
+      who: worstInstance
+        ? `<b>${esc(worstInstance.inst.instance)}</b> ${envTag(worstInstance.inst.environment)} &mdash; ${worstInstance.inst.databases.length} databases.`
+        : 'Enter the SQL rebuild hours on the Framework panel to quantify this scenario.' }
+  ];
+  document.getElementById('deckScenarios').innerHTML = scenarios.map(s =>
+    `<div class="scenario"><div class="sh">${s.h}</div><div class="sb"><div class="big">${s.big}</div><div class="who">${s.who}</div></div></div>`).join('');
+}
+
+/* ---------------------------------------------------------------------------
+   Assumptions panel
+--------------------------------------------------------------------------- */
+const CFG_FIELDS = [['cfgPROD','build.PROD'],['cfgUAT','build.UAT'],['cfgQA','build.QA'],['cfgDEV','build.DEV'],
+  ['cfgVmPROD','vm.PROD'],['cfgVmUAT','vm.UAT'],['cfgVmQA','vm.QA'],['cfgVmDEV','vm.DEV'],
+  ['cfgFactor','factor'],['cfgValidation','validation'],
+  ['cfgBuildDoc','buildDoc'],['cfgDrDoc','drDoc'],['cfgLifecycle','lifecycle']];
+
+/* "build.PROD" and "vm.PROD" live one level down; everything else sits on cfg itself. */
+const readPath = p => { const [group, key] = p.split('.'); return key ? cfg[group][key] : cfg[p]; };
+const writePath = (p, v) => { const [group, key] = p.split('.'); if (key) cfg[group][key] = v; else cfg[p] = v; };
+
+function loadAssumptions() { CFG_FIELDS.forEach(([id, path]) => document.getElementById(id).value = readPath(path) || ''); }
+
+function renderAll() { renderGlobal(); renderAppList(); renderApp(); renderInstanceList(); renderInstanceDetail(); renderDeck(); }
+
+document.getElementById('saveAssumptions').onclick = () => {
+  CFG_FIELDS.forEach(([id, path]) => writePath(path, document.getElementById(id).value.trim()));
+  try { localStorage.setItem(CFG_KEY, JSON.stringify(cfg)); } catch (e) { }
+  document.getElementById('saveStatus').textContent = 'Saved. Every panel recalculated.';
+  renderAll();
+};
+document.getElementById('resetAssumptions').onclick = () => {
+  cfg = JSON.parse(JSON.stringify(CFG_DEFAULT));
+  try { localStorage.removeItem(CFG_KEY); } catch (e) { }
+  loadAssumptions();
+  document.getElementById('saveStatus').textContent = SIMULATED ? 'Reset to the simulation examples.' : 'Reset to blank.';
+  renderAll();
+};
+
+/* A simulated report says so at the top of every panel, and in the browser tab. */
+if (SIMULATED) {
+  document.title = 'SIMULATED - ' + document.title;
+  document.getElementById('topLine').innerHTML = '<b style="background:var(--med-bg);color:var(--med);padding:2px 8px;border-radius:4px;letter-spacing:.4px">SIMULATED</b>'
+    + ' &nbsp;Every application, instance, database and figure in this report is made up. Nothing was read or contacted.';
+  document.getElementById('saveStatus').textContent = 'Example values for the simulation. Saved separately from any real report.';
+}
+
+/* ---------------------------------------------------------------------------
+   Navigation and events
+--------------------------------------------------------------------------- */
+function showView(id) {
+  document.querySelectorAll('.view-panel').forEach(v => v.classList.toggle('hidden', v.id !== id));
+  document.querySelectorAll('.nav-tab').forEach(b => b.classList.toggle('active', b.dataset.view === id));
+  window.scrollTo(0, 0);
+}
+document.querySelectorAll('.nav-tab').forEach(b => b.onclick = () => showView(b.dataset.view));
+document.getElementById('appSearch').addEventListener('input', renderAppList);
+document.getElementById('srvSearch').addEventListener('input', renderInstanceList);
+document.getElementById('envFilter').addEventListener('change', renderApp);
+
+loadAssumptions();
+renderAll();
+showView('appView');
+</script>
+</body>
+</html>
+'@
+
+$html = $html.
+    Replace('__T_BRAND__', $theme.Brand).
+    Replace('__T_BRAND_DARK__', $theme.BrandDark).
+    Replace('__T_BRAND_SOFT__', $theme.BrandSoft).
+    Replace('__T_ACCENT__', $theme.Accent).
+    Replace('__T_ACCENT_DARK__', $theme.AccentDark).
+    Replace('__T_ACCENT_SOFT__', $theme.AccentSoft).
+    Replace('__JSON__', $json).
+    Replace('__DETAILS_JSON__', $detailsJson).
+    Replace('__INSTANCE_JSON__', $instanceJson).
+    Replace('__WINDOW_DAYS__', [string]$EvidenceWindowDays).
+    Replace('__SIMULATED__', $(if ($Simulate) { 'true' } else { 'false' })).
+    Replace('__SOURCE__', $sourceName).
+    Replace('__GENERATED__', $generated).
+    Replace('__CONNECTIVITY__', $connectivityCaption).
+    Replace('__COLLECTION__', $collectionCaption)
+
+$outputDirectory = Split-Path -Parent $OutputHtml
+if ($outputDirectory -and -not (Test-Path -LiteralPath $outputDirectory)) {
+    New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
+}
+[IO.File]::WriteAllText($OutputHtml, $html, [Text.UTF8Encoding]::new($false))
+
+# =========================================================================================
+# REGION  Console summary
+# =========================================================================================
+
+$applicationCount = @($inventory.Application | Sort-Object -Unique).Count
+$databaseCount = @($inventory | ForEach-Object { '{0}|{1}' -f $_.Instance, $_.Database } | Sort-Object -Unique).Count
+$collected = @($instanceMeta | Where-Object { $_.status -eq 'Collected' }).Count
+
+Write-Host ''
+Write-Host 'Created: ' -NoNewline -ForegroundColor Green; Write-Host $OutputHtml
+Write-Host ("  Applications {0}   SQL instances {1}   Databases {2}   Workbook rows {3}" -f $applicationCount, $instanceNames.Count, $databaseCount, $inventory.Count) -ForegroundColor Cyan
+
+$environmentSpread = ($inventory | Group-Object Environment | Sort-Object Name | ForEach-Object { '{0} {1}' -f $_.Name, $_.Count }) -join '   '
+Write-Host ("  Environment spread: {0}" -f $environmentSpread) -ForegroundColor Cyan
+
+if ($Simulate) {
+    Write-Host '  SIMULATED: every name and figure in this report is made up. Do not send it as a finding.' -ForegroundColor Yellow
+    Write-Host ("  Simulated evidence for {0} of {1} instances; one is unreachable and one was never collected, on purpose." -f $collected, $instanceNames.Count) -ForegroundColor Yellow
+}
+elseif ($CollectSqlEvidence) {
+    Write-Host ("  Evidence collected from {0} of {1} instances" -f $collected, $instanceNames.Count) -ForegroundColor Cyan
+    foreach ($item in @($instanceMeta | Where-Object { $_.status -ne 'Collected' })) {
+        Write-Host ("    NOT COLLECTED  {0}  {1}" -f $item.instance, $item.message) -ForegroundColor Yellow
+    }
+}
+else {
+    Write-Host '  No SQL evidence collected, so every restore time will read NULL.' -ForegroundColor Yellow
+    Write-Host '  Re-run with -CollectSqlEvidence to measure them.' -ForegroundColor Yellow
+}
+
+Write-Host ''
+if ($Simulate) {
+    Write-Host 'Next: open the report. Example rebuild hours are already entered, so every scenario has figures.' -ForegroundColor Gray
+}
+else {
+    Write-Host 'Next: open the report, read Framework & MTTR, and enter the SQL rebuild and VM build hours there.' -ForegroundColor Gray
+}
+Write-Host 'Then pick a scenario on Application Overview or SQL Instance MTTR to walk a recovery step by step.' -ForegroundColor Gray
+Write-Host 'Everything recalculates in the browser. No need to re-run this script.' -ForegroundColor Gray
+
+if (-not $NoLaunch) { Start-Process $OutputHtml }
