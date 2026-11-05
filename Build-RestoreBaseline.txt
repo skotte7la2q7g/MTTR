@@ -1,0 +1,1859 @@
+﻿<#
+.SYNOPSIS
+  PROD vs DR MTTR Intelligence - restore-time simulation for SQL Server (model used: Opus 5.5,
+  created by SHYAM KOTTE). Builds one self-contained HTML report from the latest Excel / CSV exports.
+.DESCRIPTION
+  Run with no parameters: pop-ups ask for the Databases file, the Inventory file and (optional)
+  the Restore History file produced by the collector in the report's "Restore History" tab.
+  The HTML is saved next to the Databases file and opened in the browser.
+
+  Tabs
+    Impact & Restore Timeline - view by server, by Availability Group or by application: what is
+                                impacted, the throughput each server actually delivered
+                                (min / median / max) with the value used and why, the
+                                restore-vs-backup speed setting, restore time per database and in
+                                total, restore timeline.
+                                Colour: Availability Group / standalone with DR / standalone without DR.
+    DR Topology               - one lane per Availability Group: PROD -> DR nodes, resources, edition.
+    Restore History           - collector T-SQL + PowerShell runner, upload, match report,
+                                timed restore samples.
+
+  Inputs: .xlsx (ImportExcel module or Microsoft Excel) or .csv. Column names are matched
+  case-insensitively, ignoring spaces/underscores. Extra columns are ignored; NULL text = empty.
+     Databases  (required) ServerName, DatabaseName, DatabaseSizeMB, DatabaseStatus, Environment,
+                           ApplicationName, AGName, DatabaseClassification
+                (optional) SQLVersion, Platform, SQLEdition / Edition
+     Inventory  (required) ServerName
+                (optional) LogicalCPUCount, PhysicalMemoryGB, Size, Location, Platform, Edition
+     History    (optional) RestoreHistory_All_<date>.xlsx / .csv from the collector (or an export
+                           with the same column names). Embedded in the HTML so it opens with it.
+
+  Restore throughput per server, strongest evidence first
+     Measured  - timed restores on the server: median (range = min - max)
+     Backups   - the server's own backup speed x restore/backup ratio (measured on the estate when
+                 timed restores exist, otherwise assumed 75% - adjustable in the report)
+     Peers     - servers with similar resources (same VM size > same vCPU and memory > same vCPU >
+                 comparable vCPU), their timed restores or backups
+     Estate    - estate median (no similar server)
+     Assumed   - 200 MB/s until restore history is loaded
+     Manual    - any value picked in the report
+.EXAMPLE
+  .\Build-RestoreBaseline.ps1
+.EXAMPLE
+  .\Build-RestoreBaseline.ps1 -DatabasesXlsx '.\Current OA Databases.xlsx' -InventoryXlsx '.\SQL OA Inventory.xlsx' -RestoreHistory '.\RestoreHistory_All_20261105_0900.xlsx'
+#>
+[CmdletBinding()]
+param(
+    [string]$DatabasesXlsx,
+    [string]$InventoryXlsx,
+    [string]$RestoreHistory,
+    [string]$OutHtml,
+    [string]$DatabasesSheet,
+    [string]$InventorySheet,
+    [switch]$NoOpen
+)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Off
+
+# ---------------------------------------------------------------- file pickers (when not passed as parameters)
+function Select-File([string]$Title, [string]$StartDir, [switch]$Optional) {
+    Add-Type -AssemblyName System.Windows.Forms
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Title = $Title
+    $dlg.Filter = 'Excel or CSV (*.xlsx;*.xls;*.csv)|*.xlsx;*.xls;*.csv|All files (*.*)|*.*'
+    if ($StartDir -and (Test-Path $StartDir)) { $dlg.InitialDirectory = $StartDir }
+    $owner = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true }
+    try {
+        if ($dlg.ShowDialog($owner) -ne [System.Windows.Forms.DialogResult]::OK) {
+            if ($Optional) { return $null }
+            throw "Cancelled: $Title"
+        }
+        return $dlg.FileName
+    } finally { $owner.Dispose() }
+}
+
+$here = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$interactive = -not ($DatabasesXlsx -and $InventoryXlsx)
+if ($interactive -and $PSCommandPath -and [System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+    # file dialogs need an STA thread - relaunch this script in STA mode with the same parameters
+    $exe = (Get-Process -Id $PID).Path
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', $PSCommandPath)
+    foreach ($kv in $PSBoundParameters.GetEnumerator()) {
+        if ($kv.Value -is [System.Management.Automation.SwitchParameter]) { if ($kv.Value.IsPresent) { $argList += "-$($kv.Key)" } }
+        else { $argList += "-$($kv.Key)"; $argList += [string]$kv.Value }
+    }
+    & $exe @argList
+    return
+}
+if (-not $DatabasesXlsx) { $DatabasesXlsx = Select-File 'Step 1 of 3: select the DATABASES file (e.g. Current OA Databases.xlsx)' $here }
+if (-not $InventoryXlsx) { $InventoryXlsx = Select-File 'Step 2 of 3: select the SERVER INVENTORY file (e.g. SQL OA Inventory.xlsx)' (Split-Path $DatabasesXlsx) }
+if ($interactive -and -not $RestoreHistory) {
+    $RestoreHistory = Select-File 'Step 3 of 3 (optional): select the RESTORE HISTORY file (RestoreHistory_All_*.xlsx) - Cancel to skip' (Split-Path $DatabasesXlsx) -Optional
+}
+if (-not $OutHtml) {
+    $OutHtml = Join-Path (Split-Path $DatabasesXlsx) ("MTTR_Intelligence_{0:yyyyMMdd_HHmm}.html" -f (Get-Date))
+}
+Write-Host "Databases file : $DatabasesXlsx"
+Write-Host "Inventory file : $InventoryXlsx"
+Write-Host ("History file   : {0}" -f $(if ($RestoreHistory) { $RestoreHistory } else { '(none - can be loaded in the report)' }))
+
+# ---------------------------------------------------------------- HTML template (do not edit inside)
+$Template = @'
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PROD vs DR MTTR Intelligence</title>
+<style>
+:root{color-scheme:light;--ink:#14212f;--ink2:#46566a;--mute:#7b8794;--line:#e3e7ee;--line2:#d3dbe6;--bg:#f4f6f9;--card:#fff;--navy:#0b2545;--blue:#1f5fa8;
+ --grid:#e8e7e1;--axis:#c3c2b7;--chart:#fcfcfb;
+ --c-ag:#5b45b0;--c-ag-bg:#f3f0fc;--c-dr:#0b7a6e;--c-dr-bg:#e9f6f3;--c-nodr:#c2410c;--c-nodr-bg:#fdefe7}
+*{box-sizing:border-box}[hidden]{display:none!important}
+body{margin:0;font:13px/1.45 "Segoe UI",system-ui,-apple-system,Arial,sans-serif;background:var(--bg);color:var(--ink)}
+header{background:#0b2545;color:#fff;padding:16px 28px 10px}
+.hrow{display:flex;flex-wrap:wrap;gap:12px 24px;align-items:flex-end;justify-content:space-between;max-width:1680px;margin:0 auto}
+.eyebrow{font-size:11px;letter-spacing:.14em;text-transform:uppercase;opacity:.7;font-weight:600}
+header h1{margin:2px 0 0;font-size:23px;font-weight:700}
+header .sub{margin:2px 0 0;font-size:13.5px;opacity:.9}
+header .gen{margin:8px auto 0;font-size:11.5px;opacity:.68;max-width:1680px}
+.hctl{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.hbtn{display:inline-flex;align-items:center;gap:6px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.4);color:#fff;padding:7px 14px;border-radius:6px;cursor:pointer;font:600 12.5px "Segoe UI",system-ui,sans-serif}
+.hbtn:hover{background:rgba(255,255,255,.2)}
+.hpill{font-size:11.5px;padding:4px 10px;border-radius:12px;background:rgba(255,255,255,.14);max-width:520px}
+.hpill.ok{background:#d5f2ec;color:#0b5f58;font-weight:600}
+nav{display:flex;gap:2px;padding:0 28px;background:#fff;position:sticky;top:0;z-index:5;border-bottom:1px solid var(--line);overflow-x:auto}
+nav button{border:0;background:none;padding:12px 16px 9px;cursor:pointer;font:600 13px "Segoe UI",system-ui,sans-serif;color:var(--ink2);border-bottom:3px solid transparent;white-space:nowrap}
+nav button:hover{color:var(--navy)}nav button.on{color:var(--navy);border-bottom-color:var(--blue)}
+section{display:none}section.on{display:block}
+main{padding:18px 28px 6px;max-width:1680px;margin:0 auto}
+.card{background:var(--card);border-radius:8px;border:1px solid var(--line);padding:16px 18px;margin-bottom:16px}
+h2{margin:0 0 10px;font-size:15px;color:var(--navy);display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+h3{margin:14px 0 6px;font-size:13px;color:var(--navy);display:flex;align-items:center;gap:6px}
+.bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center}.bar .sp{flex:1}.bar h2{margin:0}
+select,input[type=number],input[type=search]{font:13px "Segoe UI",system-ui,sans-serif;padding:6px 9px;border-radius:6px;border:1px solid #b7c3d3;background:#fff;color:var(--ink)}
+select.big{font-size:14px;padding:7px 10px;min-width:380px;max-width:100%}
+input[type=range]{accent-color:var(--blue)}
+.small{font-size:11.5px;color:var(--mute)}.muted{color:var(--mute)}.none{color:#a0a9b4;font-style:italic}.real{color:#0d7a72;font-weight:600}
+.num{text-align:right;white-space:nowrap}.scroll{overflow:auto}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{background:#eef2f7;text-align:left;padding:7px 8px;font-weight:600;color:#2b3a4c;vertical-align:bottom}
+td{padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th.p{background:#e3ecf9}th.d{background:#fdf0dc}.grp th{text-align:center;font-size:11px;letter-spacing:.08em}
+code{font:12px Consolas,monospace;background:#eef2f7;padding:0 4px;border-radius:3px}
+.pill{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:600;background:#eceff3;color:#3f4c5c;white-space:nowrap}
+.p-prod{background:#e3ecf9;color:#1c4f91}.p-dr{background:#fff0d9;color:#8a5a00}.p-oth{background:#eef1f5;color:#566476}
+.pill.ok{background:#dff5f2;color:#0b6b64}.pill.warn{background:#fff0d9;color:#8a5a00}.pill.off{background:#fde3e3;color:#a32b2b}.pill.oth{background:#eef1f5;color:#566476;font-weight:500}
+.pills{display:flex;flex-wrap:wrap;gap:4px;margin-top:3px}
+.pf{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;padding:1px 8px 1px 7px;border-radius:10px;background:#fff;border:1px solid var(--line2);color:#36465a;white-space:nowrap}
+.pf i{width:7px;height:7px;border-radius:50%;background:#aab2bd;display:inline-block}
+.pf-i i{background:#2a78d6}.pf-p i{background:#6250d6}.pf-o i{background:#1baf7a}
+.bd{display:inline-block;font-size:9.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;padding:2px 7px;border-radius:10px;white-space:nowrap;vertical-align:1px}
+.bd.meas{background:#e3f5f2;color:#0b6b64}.bd.est{background:#e6f0fb;color:#1c5cab}.bd.asm{background:#f1f3f5;color:#6b7785}.bd.man{background:#fdeee5;color:#b4410f}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:4px}
+.d-meas{background:#0d7a72}.d-est{background:#1f5fa8}.d-asm{background:#aab2bd}.d-man{background:#d0601f}
+.mx{white-space:nowrap;margin-right:8px}
+.cf{font-size:11px;font-weight:600;padding:0 6px;border-radius:8px;background:#eef1f5;color:#4b5b70}
+.cf-high{background:#dff5f2;color:#0b6b64}.cf-medium{background:#e6f0fb;color:#1c5cab}.cf-low{background:#fff0d9;color:#8a5a00}.cf-none{background:#fde3e3;color:#a32b2b}.cf-manual{background:#fdeee5;color:#b4410f}
+.info{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;border:1px solid #9fb0c6;background:#fff;color:#4b6584;font:italic 700 11px Georgia,"Times New Roman",serif;cursor:pointer;padding:0;line-height:1;flex:none;vertical-align:middle}
+.info:hover,.info:focus-visible{background:var(--blue);border-color:var(--blue);color:#fff;outline:none}
+.btn{background:var(--blue);color:#fff;border:0;padding:6px 13px;border-radius:6px;cursor:pointer;font:600 12px "Segoe UI",system-ui,sans-serif}
+.btn.sec{background:#e6edf6;color:#1f3b5c}.btn:hover{filter:brightness(1.07)}
+.lnk{border:0;background:none;color:var(--blue);cursor:pointer;font:600 11.5px "Segoe UI",system-ui,sans-serif;padding:0 3px;text-decoration:underline;text-underline-offset:2px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;margin-top:14px}
+.kpi{background:#f8fafc;border:1px solid var(--line);border-top:3px solid #9fb0c6;border-radius:6px;padding:9px 12px 10px}
+.kpi.pr{border-top-color:#1f5fa8}.kpi.dr{border-top-color:#e8a33d}.kpi.hl{border-top-color:#0d7a72}
+.kpi .l{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--ink2);font-weight:600}
+.kpi .v{display:block;font-size:22px;font-weight:700;margin-top:2px;color:var(--ink)}
+.kpi .s{display:block;font-size:11.5px;color:var(--mute);margin-top:1px}
+.specs{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px;align-items:stretch}
+.sbox{border-radius:6px;padding:9px 12px;min-width:240px;font-size:12.5px}.sbox .nm{font-size:13.5px;display:block}
+.sbox .role{display:block;font-size:10.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase}
+.sbox.p{background:#f5f8fd;border:1px solid #c5d6ef}.sbox.p .role{color:#1c5cab}
+.sbox.d{background:#fffaf1;border:1px solid #efd3a3}.sbox.d .role{color:#8a5a00}
+.sbox.n{background:#f6f7f9;border:1px dashed #c2cad5}.sbox .tp{margin-top:6px;padding-top:6px;border-top:1px solid rgba(0,0,0,.07)}
+.sarrow{align-self:center;font-size:22px;color:#8a96a5}
+.gh{margin:16px 0 6px;padding:9px 11px;background:#f4f7fb;border:1px solid var(--line);border-radius:6px}
+.gh-t{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;margin-bottom:3px}.gh-t b{font-size:13.5px;color:var(--navy)}
+.gtot{margin-top:3px;color:var(--ink2)}
+.rt{display:inline-flex;flex-direction:column;align-items:flex-end;min-width:88px;border:1px solid var(--line2);background:#fff;border-radius:6px;padding:3px 8px;cursor:pointer;font:inherit;color:var(--ink);text-align:right;line-height:1.2}
+.rt b{font-size:13px}.rt i{font-style:normal;font-size:9px;font-weight:700;letter-spacing:.07em;text-transform:uppercase}.rt small{font-size:10.5px;color:var(--mute)}
+.rt:hover,.rt:focus-visible{box-shadow:0 0 0 3px rgba(31,95,168,.18);outline:none}
+.rt.b-meas i{color:#0b6b64}.rt.b-est i{color:#1c5cab}.rt.b-asm i{color:#6b7785}.rt.b-man i{color:#b4410f}
+.lg{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:10px;font-size:11.5px;color:var(--ink2);align-items:center}
+.ctl{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px 18px;margin:12px 0 4px;padding:10px 12px;background:#f8fafc;border:1px solid var(--line);border-radius:6px}
+.f label{display:flex;align-items:center;gap:5px;font-size:11.5px;color:var(--ink2);font-weight:600;margin-bottom:3px;cursor:help}
+.f .fr{display:flex;align-items:center;gap:8px}.f .fr input{flex:1;min-width:0}.f output{font-weight:700;min-width:48px;text-align:right}
+.f select{width:100%}.f label.chk{cursor:pointer;margin-top:18px}
+.seg{display:inline-flex;border:1px solid #b7c3d3;border-radius:6px;overflow:hidden}
+.seg button{border:0;background:#fff;padding:5px 14px;font:600 12px "Segoe UI",system-ui,sans-serif;color:var(--ink2);cursor:pointer}
+.seg button+button{border-left:1px solid #b7c3d3}.seg button.on{background:var(--navy);color:#fff}.seg button:disabled{color:#b5bdc8;cursor:not-allowed}
+#tl{margin-top:10px}#tl svg{display:block;max-width:100%;height:auto;background:var(--chart);border-radius:6px;border:1px solid #efeee9}
+.gl{stroke:var(--grid);stroke-width:1}.ax{stroke:var(--axis);stroke-width:1}
+.tk{font:11px "Segoe UI",system-ui,sans-serif;fill:#898781}.ll{font:600 11px "Segoe UI",system-ui,sans-serif;fill:#52514e}
+.mk{stroke:#52514e;stroke-width:1}.mkl{font:600 11px "Segoe UI",system-ui,sans-serif;fill:#0b0b0b}.hit{fill:transparent}
+.tb:hover rect:not(.hit){filter:brightness(.88)}
+.sw{width:11px;height:11px;border-radius:3px;display:inline-block;flex:none}.lgi{display:inline-flex;align-items:center;gap:6px}
+#tip{position:fixed;z-index:60;pointer-events:none;background:#fff;border:1px solid var(--line2);box-shadow:0 8px 24px rgba(16,24,40,.16);border-radius:6px;padding:8px 10px;font-size:12px;max-width:360px;display:none;line-height:1.4}
+#apprec h3{margin-top:0}
+.sr td{vertical-align:middle}.sl{display:flex;align-items:center;gap:8px;min-width:250px}.sl input{flex:1}.sl output{font-weight:700;min-width:78px;color:#1c4f91}
+.lane{border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin-bottom:12px;background:#fff}
+.lane-h{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;margin-bottom:10px}.lane-h .t{font-size:15px;font-weight:700;color:var(--navy)}
+.lane-b{display:grid;grid-template-columns:minmax(0,1.3fr) 96px minmax(0,1fr);gap:12px;align-items:stretch}
+.lane.ag{border-left:5px solid var(--c-ag)}
+.region{border:1px dashed #9bb8e6;border-radius:6px;padding:8px 10px;background:#f8fafd}.region.dr{border-color:#f0c27a;background:#fffcf6}
+.region h4{margin:0 0 6px;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:#1c5cab}.region.dr h4{color:#8a5a00}
+.nodes{display:flex;flex-wrap:wrap;gap:8px}
+.node{background:#fff;border:1px solid #c5d6ef;border-radius:6px;padding:6px 9px;min-width:180px;font-size:12px}.region.dr .node{border-color:#efd3a3}
+.node>b{display:block;font-size:12.5px}
+.flow{display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--mute);font-size:11px;text-align:center;gap:2px}
+.lane-m{border-left:1px solid var(--line);padding-left:12px;display:flex;flex-direction:column;justify-content:center;gap:3px;font-size:12px}
+.lane-m .rl{font-size:10.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--mute)}
+.lane details{margin-top:8px}
+@media (max-width:1100px){.lane-b{grid-template-columns:1fr}.flow{flex-direction:row;gap:8px}.flow svg{transform:rotate(90deg)}.lane-m{border-left:0;padding-left:0;border-top:1px solid var(--line);padding-top:8px}}
+details summary{cursor:pointer;color:var(--ink2)}
+pre{background:#0f1b2b;color:#d7e3f4;padding:12px;border-radius:6px;overflow:auto;font-size:11.5px;max-height:440px;margin:8px 0 0}
+.mdl{position:fixed;inset:0;background:rgba(11,37,69,.45);display:flex;align-items:center;justify-content:center;z-index:50;padding:16px}
+.mbox{background:#fff;border-radius:10px;box-shadow:0 18px 50px rgba(0,0,0,.28);width:min(760px,96vw);max-height:88vh;overflow:auto;border-top:4px solid #1f5fa8}
+.mbox.meas{border-color:#0d7a72}.mbox.asm{border-color:#8a96a5}.mbox.man{border-color:#d0601f}
+.mh{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:14px 18px 8px;position:sticky;top:0;background:#fff;z-index:1}.mh b{font-size:16px;color:var(--navy)}
+.x{border:0;background:none;font-size:24px;line-height:1;cursor:pointer;color:#6b7785}
+#mb{padding:0 18px 18px}#mb p{margin:8px 0}
+.kv td:first-child{color:var(--ink2);width:32%;font-weight:600}
+.why{font-size:13px;color:#22313f;background:#f4f7fb;border-left:3px solid var(--blue);border-radius:4px;padding:10px 12px;margin:4px 0 12px;line-height:1.55}
+.fx{font-size:12px;color:#3f4c5c;background:#f4f7fb;border-radius:6px;padding:9px 11px;margin:12px 0 0}.warnbox{background:#fff4e0;color:#6b4500}
+.src tr.use td{background:#f3fbf9;font-weight:600}
+/* AG / standalone-with-DR / standalone-without-DR colour coding */
+.cat{width:10px;height:10px;border-radius:3px;display:inline-block;flex:none}.cat.ag{background:var(--c-ag)}.cat.dr{background:var(--c-dr)}.cat.nodr{background:var(--c-nodr)}
+.lgc{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--ink2);white-space:nowrap}
+.catp{display:inline-flex;align-items:center;font-size:10.5px;font-weight:700;letter-spacing:.03em;padding:1px 8px;border-radius:10px;white-space:nowrap}
+.catp.ag{background:var(--c-ag-bg);color:var(--c-ag)}.catp.dr{background:var(--c-dr-bg);color:var(--c-dr)}.catp.nodr{background:var(--c-nodr-bg);color:var(--c-nodr)}
+tr.ag>td:first-child{box-shadow:inset 3px 0 0 var(--c-ag)}tr.dr>td:first-child{box-shadow:inset 3px 0 0 var(--c-dr)}tr.nodr>td:first-child{box-shadow:inset 3px 0 0 var(--c-nodr)}
+.gh.ag{background:var(--c-ag-bg);border-left:5px solid var(--c-ag)}.gh.dr{background:var(--c-dr-bg);border-left:5px solid var(--c-dr)}.gh.nodr{background:var(--c-nodr-bg);border-left:5px solid var(--c-nodr)}
+.sbox.p.ag{border-left:5px solid var(--c-ag)}.sbox.p.dr{border-left:5px solid var(--c-dr)}.sbox.p.nodr{border-left:5px solid var(--c-nodr)}
+option.ag{background:var(--c-ag-bg)}option.dr{background:var(--c-dr-bg)}option.nodr{background:var(--c-nodr-bg)}
+/* throughput card on the impact tab */
+.thr td{vertical-align:middle}.thr .v3{white-space:nowrap}.thr .v3 b{font-size:13px}.thr tr.is-man td{background:#fffaf6}
+.thr .whyl{font-size:11.5px;color:var(--ink2);max-width:420px;line-height:1.35;margin-top:2px}
+.pick{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
+.pk{border:1px solid var(--line2);background:#fff;border-radius:12px;padding:1px 9px;font:600 11px "Segoe UI",system-ui,sans-serif;color:#1c4f91;cursor:pointer;white-space:nowrap}
+.pk:hover{background:#eaf1fb}.pk.on{background:#1c4f91;border-color:#1c4f91;color:#fff}
+.kctl{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;margin-top:12px;padding:9px 12px;background:#f8fafc;border:1px solid var(--line);border-radius:6px;font-size:12.5px}
+.kctl input{width:180px}.kctl output{font-weight:700;color:#1c4f91}
+/* Availability Group view */
+.agt{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--ink2);font-weight:600;padding:4px 10px;background:var(--c-ag-bg);border:1px solid #d9d0f5;border-radius:6px}
+.agt select{font-size:12.5px;padding:3px 6px;min-width:0}
+.agsum{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center;margin-top:14px;padding:10px 12px;background:var(--c-ag-bg);border-left:5px solid var(--c-ag);border-radius:6px}
+.agsum b.t{font-size:15px;color:var(--navy)}
+.agcov{margin:8px 0 0;padding-left:18px;color:var(--ink2);font-size:12.5px}.agcov li{margin:2px 0}
+.thr tr.tgt td{background:#f6f3fe}.tgtp{font-size:10px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:1px 7px;border-radius:9px;background:var(--c-ag);color:#fff;white-space:nowrap}
+footer{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;padding:14px 28px 24px;color:var(--mute);font-size:12px;max-width:1680px;margin:0 auto;border-top:1px solid var(--line)}
+footer .nm{color:var(--navy);font-weight:700;letter-spacing:.08em}
+@media print{nav,.hctl,.ctl,.kctl,.pick,.sl input,.no-print,#tip,.info{display:none!important}section{display:block!important}body{background:#fff}header{print-color-adjust:exact;-webkit-print-color-adjust:exact}}
+</style></head><body>
+<header>
+ <div class="hrow">
+  <div><h1>PROD vs DR MTTR Intelligence</h1><p class="sub">Model used: Opus 5.5 · Created by SHYAM KOTTE</p></div>
+  <div class="hctl"><span class="hpill" id="hs">Restore history not loaded</span><label class="hbtn" title="Load RestoreHistory_All_*.xlsx or .csv from the collector"><input type="file" id="hfile" accept=".xlsx,.csv" hidden>Load restore history</label></div>
+ </div>
+</header>
+<nav id="nav" role="tablist"><button data-k="imp" class="on" role="tab">Impact &amp; Restore Timeline</button><button data-k="topo" role="tab">DR Topology</button><button data-k="col" role="tab">Restore History</button></nav>
+
+<section id="s-imp" class="on"><main>
+ <div class="card">
+  <div class="bar"><select id="mode"><option value="srv">View by server</option><option value="ag">View by Availability Group</option><option value="app">View by application</option></select><select id="srvsel" class="big" aria-label="Server"></select><select id="agsel" class="big" aria-label="Availability Group" hidden></select><select id="app" class="big" aria-label="Application" hidden></select>
+   <span id="agtgt" class="agt" hidden title="Where the AG databases would be restored if every replica were lost. Default: the replica with the strongest evidence of its own (timed restores, then most backups).">Restore on: PROD <select id="agp" aria-label="PROD restore target"></select> DR <select id="agd" aria-label="DR restore target"></select></span><span class="sp"></span>
+   <span class="lg" style="margin:0"><span class="bd meas" title="Timed restores on this server">Measured</span><span class="bd est" title="From this server's backups, similar servers or the estate">Estimated</span><span class="bd asm" title="200 MB/s placeholder - no evidence yet">Assumed</span><span class="bd man" title="Throughput you picked">Manual</span></span></div>
+  <div class="lg" id="catlg"></div>
+  <div class="kpis" id="k"></div>
+  <div id="srvt"></div>
+ </div>
+ <div class="card" id="thrcard">
+  <div class="bar"><h2>Restore throughput — what these servers actually delivered</h2><span class="sp"></span><span class="small" id="thrk"></span></div>
+  <p class="small" style="margin:4px 0 0">Observed = min / median / max from the history. Recommended = the value used, with the reason. Pick min, median or max — or drag — to simulate; <b>i</b> shows how each number was derived.</p>
+  <div class="kctl" id="kctl" hidden><span title="Applies to every estimate taken from backup speeds: a server's own backups, similar servers' backups and the estate backup median.">Restores run at</span><input type="range" id="i_k" min="40" max="100" step="5" aria-label="Restore speed as a percentage of backup speed"><output id="o_k"></output><span>of backup speed</span><span class="small" id="kwhy"></span></div>
+  <div id="thr" class="scroll" style="margin-top:8px"></div>
+ </div>
+ <div class="card">
+  <div class="bar"><h2>Restore timeline</h2><span class="seg" id="sidesel"><button data-side="P" class="on">PROD</button><button data-side="R">DR</button></span><span class="sp"></span><span class="small" id="tlcap"></span></div>
+  <div class="ctl" id="ctl">
+   <div class="f"><label for="i_ovh" title="Time per database outside the RESTORE itself: locate files, start, post-restore steps. Scripted 1-2 min, manual 5-10 min.">Overhead per database</label><div class="fr"><input type="range" id="i_ovh" min="0" max="30" step="1"><output id="o_ovh"></output></div></div>
+   <div class="f"><label for="i_streams" title="How many databases are restored at the same time. Restores on the same server share it: together they never exceed the top of that server's throughput range.">Parallel restore streams</label><div class="fr"><input type="range" id="i_streams" min="1" max="16" step="1"><output id="o_streams"></output></div></div>
+   <div class="f"><label for="i_basis" title="Backup data size = data the restore actually writes. Allocated size = data + log files, conservative.">Restore volume</label><select id="i_basis"><option value="backup">Backup data size</option><option value="alloc">Allocated size (conservative)</option></select></div>
+   <div class="f"><label for="i_order" title="Largest first gives the shortest total; smallest first brings most databases online soonest.">Restore order</label><select id="i_order"><option value="lpt">Largest first</option><option value="spt">Smallest first</option></select></div>
+   <div class="f"><label class="chk" title="Names with date suffixes, _old, _bak, PITR, _Arch_, XFER_ ..."><input type="checkbox" id="i_excl"> Exclude likely copies / archives</label></div>
+  </div>
+  <div id="tl"></div><div class="lg" id="tlg"></div>
+  <div id="apprec" style="margin-top:14px"></div>
+ </div>
+ <div class="card" id="impact"></div>
+ <div class="card" id="appcard" hidden><h2 id="t1"></h2><div class="scroll"><table id="tb"></table></div></div>
+ <div class="card"><h2>Offline / not-online databases (excluded)</h2><div id="off"></div></div>
+</main></section>
+
+<section id="s-topo"><main id="topomain"></main></section>
+
+<section id="s-col"><main>
+ <div class="card"><h2>1 · Restore &amp; backup history T-SQL</h2><p class="small">Run on every PROD and DR server — and optionally on non-PROD servers: their restores (refreshes) add samples for estimates. Read-only (msdb, error log, catalog views). SQL Server 2008 R2 → 2022 and Azure SQL MI.</p>
+  <div class="bar"><button class="btn" data-cp="sqlall" data-lbl="Copy T-SQL">Copy T-SQL</button><button class="btn sec" data-dl="sqlall" data-fn="Restore_History_All.sql">Download Restore_History_All.sql</button></div><pre id="sqlall"></pre></div>
+ <div class="card"><h2>2 · PowerShell runner</h2><p class="small">Save it next to <b>Restore_History_All.sql</b>. Output: <b>RestoreHistory_All_&lt;date&gt;.xlsx</b> (or .csv). Needs the SqlServer module (Invoke-Sqlcmd).</p>
+  <div class="bar"><button class="btn" data-cp="psall" data-lbl="Copy PowerShell">Copy PowerShell</button><button class="btn sec" data-dl="psall" data-fn="Run-RestoreHistory.ps1">Download Run-RestoreHistory.ps1</button></div><pre id="psall"></pre></div>
+ <div class="card"><h2>3 · Load restore history</h2><input type="file" id="csv" accept=".xlsx,.csv"><p class="small">Or rebuild the report with <code>-RestoreHistory &lt;file&gt;</code> (or pick the file in step 3 of the pop-ups) to embed the history.</p><div id="match" style="margin-top:12px"></div></div>
+ <div class="card"><details><summary><b>Column reference</b></summary><div id="colref" style="margin-top:8px"></div></details></div>
+</main></section>
+
+<footer><span class="nm">SHYAM KOTTE</span><span>Model used: Opus 5.5 · simulation tool — estimates for planning</span></footer>
+<div id="mdl" class="mdl" hidden><div class="mbox" id="mbox" role="dialog" aria-modal="true" aria-labelledby="mt"><div class="mh"><div><b id="mt"></b><div class="small" id="ms"></div></div><button class="x" id="mx" title="Close" aria-label="Close">×</button></div><div id="mb"></div></div></div>
+<div id="tip" role="tooltip"></div>
+<script type="text/plain" id="src-sql">
+/* =====================================================================
+   MTTR Intelligence - restore & backup throughput collector
+   Run on every PROD and DR server (optionally also non-PROD servers:
+   their restores, e.g. refreshes, add samples for estimates).
+   Read-only: msdb history, SQL Server error log, catalog views.
+   SQL Server 2008 R2 -> 2022 and Azure SQL Managed Instance.
+
+   ONE result set, two kinds of rows:
+     RowType = 'Database' : one row per user database - latest full restore,
+                            latest full backup, backup-throughput statistics,
+                            file sizes and instance facts (vCPU, memory, IFI)
+     RowType = 'Restore'  : one row per FULL restore whose completion is still
+                            in the error log = one measured throughput sample
+
+   Restore duration = msdb restorehistory.restore_date (start) -> first
+                      "Database was restored" entry for that database in the
+                      error log, before the next restore of the same database
+   Restore MB/s     = uncompressed backup size / restore duration
+   Backup MB/s      = uncompressed backup size / backup duration - full
+                      backups taken on THIS server, VSS snapshots excluded
+   Tip: keep 30+ error logs to retain more samples.
+   ===================================================================== */
+SET NOCOUNT ON;
+DECLARE @BackupDays int, @MinSampleMB int;
+SET @BackupDays  = 30;     -- window for backup-throughput statistics
+SET @MinSampleMB = 1024;   -- smaller backups are left out of the statistics
+
+/* 1. Instance facts */
+DECLARE @srv nvarchar(256), @cpu int, @memGB decimal(10,1), @ifi varchar(3), @vmt nvarchar(60), @ver nvarchar(128), @eng int, @ed nvarchar(128);
+SET @srv = CAST(SERVERPROPERTY('ServerName') AS nvarchar(256));
+SET @ver = CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128));
+SET @eng = CAST(SERVERPROPERTY('EngineEdition') AS int);
+SET @ed  = CAST(SERVERPROPERTY('Edition') AS nvarchar(128));
+BEGIN TRY SELECT @cpu = cpu_count FROM sys.dm_os_sys_info; END TRY BEGIN CATCH END CATCH;
+BEGIN TRY
+  EXEC sp_executesql N'SELECT @m = CAST(physical_memory_kb / 1048576.0 AS decimal(10,1)) FROM sys.dm_os_sys_info',
+       N'@m decimal(10,1) OUTPUT', @m = @memGB OUTPUT;
+END TRY
+BEGIN CATCH
+  BEGIN TRY
+    EXEC sp_executesql N'SELECT @m = CAST(physical_memory_in_bytes / 1073741824.0 AS decimal(10,1)) FROM sys.dm_os_sys_info',
+         N'@m decimal(10,1) OUTPUT', @m = @memGB OUTPUT;
+  END TRY BEGIN CATCH END CATCH;
+END CATCH;
+BEGIN TRY
+  EXEC sp_executesql N'SELECT @o = MAX(instant_file_initialization_enabled) FROM sys.dm_server_services WHERE filename LIKE N''%sqlservr.exe%''',
+       N'@o varchar(3) OUTPUT', @o = @ifi OUTPUT;
+END TRY BEGIN CATCH END CATCH;
+SET @ifi = CASE @ifi WHEN 'Y' THEN 'Yes' WHEN 'N' THEN 'No' ELSE NULL END;
+BEGIN TRY
+  EXEC sp_executesql N'SELECT @o = virtual_machine_type_desc FROM sys.dm_os_sys_info',
+       N'@o nvarchar(60) OUTPUT', @o = @vmt OUTPUT;
+END TRY BEGIN CATCH END CATCH;
+
+/* 2. "Database was restored" entries from every error log */
+IF OBJECT_ID('tempdb..#logs') IS NOT NULL DROP TABLE #logs;
+CREATE TABLE #logs (ArchiveNo int, LogDate nvarchar(50), LogSizeBytes bigint);
+BEGIN TRY INSERT #logs EXEC master.sys.xp_enumerrorlogs 1; END TRY BEGIN CATCH END CATCH;
+DECLARE @maxLog int, @i int;
+SELECT @maxLog = ISNULL(MAX(ArchiveNo), 6) FROM #logs;
+IF OBJECT_ID('tempdb..#el') IS NOT NULL DROP TABLE #el;
+CREATE TABLE #el (LogDate datetime, ProcessInfo nvarchar(64), [Text] nvarchar(max));
+SET @i = 0;
+WHILE @i <= @maxLog
+BEGIN
+  BEGIN TRY INSERT #el EXEC master.dbo.xp_readerrorlog @i, 1, N'Database was restored'; END TRY BEGIN CATCH END CATCH;
+  SET @i = @i + 1;
+END;
+
+/* 3. FULL restores, with the completion time when it is in the error log */
+IF OBJECT_ID('tempdb..#rs') IS NOT NULL DROP TABLE #rs;
+SELECT rh.restore_history_id,
+       DatabaseName = rh.destination_database_name,
+       StartTime    = rh.restore_date,
+       RestoredBy   = rh.user_name,
+       FromServer   = bs.server_name,
+       FromDatabase = bs.database_name,
+       BackupMB     = CAST(bs.backup_size / 1048576.0 AS decimal(18,1)),
+       CompressedMB = CAST(bs.compressed_backup_size / 1048576.0 AS decimal(18,1)),
+       SourceSec    = DATEDIFF(SECOND, bs.backup_start_date, bs.backup_finish_date),
+       DeviceType   = (SELECT MAX(f.device_type) FROM msdb.dbo.backupmediafamily f WHERE f.media_set_id = bs.media_set_id),
+       Files        = (SELECT COUNT(*) FROM msdb.dbo.backupmediafamily f WHERE f.media_set_id = bs.media_set_id AND ISNULL(f.mirror, 0) = 0),
+       CompletedAt  = lc.CompletedAt,
+       Sec          = DATEDIFF(SECOND, rh.restore_date, lc.CompletedAt)
+INTO #rs
+FROM msdb.dbo.restorehistory rh
+LEFT JOIN msdb.dbo.backupset bs ON bs.backup_set_id = rh.backup_set_id
+OUTER APPLY (SELECT TOP 1 nx.restore_date AS NextStart
+             FROM msdb.dbo.restorehistory nx
+             WHERE nx.destination_database_name = rh.destination_database_name
+               AND nx.restore_date > rh.restore_date
+             ORDER BY nx.restore_date) n
+OUTER APPLY (SELECT TOP 1 c.LogDate AS CompletedAt
+             FROM #el c
+             WHERE CHARINDEX((N'Database: ' + rh.destination_database_name + N',') COLLATE DATABASE_DEFAULT, c.[Text] COLLATE DATABASE_DEFAULT) > 0
+               AND c.LogDate >= rh.restore_date
+               AND c.LogDate <= ISNULL(n.NextStart, DATEADD(DAY, 3, rh.restore_date))
+             ORDER BY c.LogDate) lc
+WHERE rh.restore_type = 'D';
+
+IF OBJECT_ID('tempdb..#lr') IS NOT NULL DROP TABLE #lr;
+SELECT *, rn = ROW_NUMBER() OVER (PARTITION BY DatabaseName ORDER BY StartTime DESC, restore_history_id DESC)
+INTO #lr FROM #rs;
+DELETE FROM #lr WHERE rn > 1;
+
+/* 4. Full backups taken on THIS server: latest per database + throughput statistics */
+IF OBJECT_ID('tempdb..#lb') IS NOT NULL DROP TABLE #lb;
+SELECT database_name, backup_start_date, backup_finish_date, backup_size, compressed_backup_size, media_set_id,
+       rn = ROW_NUMBER() OVER (PARTITION BY database_name ORDER BY is_copy_only, backup_finish_date DESC)
+INTO #lb
+FROM msdb.dbo.backupset
+WHERE type = 'D'
+  AND ISNULL(is_snapshot, 0) = 0
+  AND server_name IN (@@SERVERNAME, @srv);
+DELETE FROM #lb WHERE rn > 1;
+
+IF OBJECT_ID('tempdb..#bk') IS NOT NULL DROP TABLE #bk;
+SELECT database_name,
+       MBps = CAST(backup_size / 1048576.0 / NULLIF(DATEDIFF(SECOND, backup_start_date, backup_finish_date), 0) AS decimal(18,1))
+INTO #bk
+FROM msdb.dbo.backupset
+WHERE type = 'D'
+  AND ISNULL(is_snapshot, 0) = 0
+  AND server_name IN (@@SERVERNAME, @srv)
+  AND backup_finish_date >= DATEADD(DAY, -@BackupDays, GETDATE())
+  AND backup_size >= @MinSampleMB * 1048576.0
+  AND DATEDIFF(SECOND, backup_start_date, backup_finish_date) >= 10;
+
+IF OBJECT_ID('tempdb..#bks') IS NOT NULL DROP TABLE #bks;
+SELECT database_name,
+       BackupSamples    = MAX(cnt),
+       BackupMBpsMin    = MIN(MBps),
+       BackupMBpsMedian = CAST(SUM(CASE WHEN rn IN ((cnt + 1) / 2, (cnt + 2) / 2) THEN MBps ELSE 0 END)
+                             / SUM(CASE WHEN rn IN ((cnt + 1) / 2, (cnt + 2) / 2) THEN 1 ELSE 0 END) AS decimal(18,1)),
+       BackupMBpsMax    = MAX(MBps)
+INTO #bks
+FROM (SELECT database_name, MBps,
+             rn  = ROW_NUMBER() OVER (PARTITION BY database_name ORDER BY MBps),
+             cnt = COUNT(*) OVER (PARTITION BY database_name)
+      FROM #bk WHERE MBps IS NOT NULL) s
+GROUP BY database_name;
+
+/* 5. Output */
+IF OBJECT_ID('tempdb..#out') IS NOT NULL DROP TABLE #out;
+CREATE TABLE #out (
+  RowType varchar(10), ServerName nvarchar(256), DatabaseName nvarchar(256),
+  SizeMB bigint, DataMB bigint, LogMB bigint, [State] nvarchar(60), RecoveryModel nvarchar(60),
+  LastRestoreDate varchar(30), RestoredFromServer nvarchar(256), RestoredFromDatabase nvarchar(256), RestoredBy nvarchar(256),
+  RestoreBackupMB decimal(18,1), RestoreCompressedMB decimal(18,1), RestoreStartTime varchar(19), RestoreCompletedTime varchar(19),
+  RestoreDurationSec int, RestoreDuration varchar(16), RestoreDurationSource varchar(30), RestoreMBps decimal(18,1),
+  RestoreDevice varchar(30), RestoreFiles int, SourceBackupSec int, SourceBackupMBps decimal(18,1),
+  RestoreCount int, MeasuredRestores int,
+  LastFullBackupDate varchar(19), LastFullBackupMB decimal(18,1), LastFullBackupCompressedMB decimal(18,1), LastFullBackupSec int,
+  BackupMBps decimal(18,1), BackupDevice varchar(30), BackupFiles int,
+  BackupSamples int, BackupMBpsMin decimal(18,1), BackupMBpsMedian decimal(18,1), BackupMBpsMax decimal(18,1),
+  HostCPU int, HostMemoryGB decimal(10,1), InstantFileInit varchar(3), VmType nvarchar(60), SqlVersion nvarchar(128), EngineEdition int, SqlEdition nvarchar(128));
+
+INSERT #out (RowType, ServerName, DatabaseName, SizeMB, DataMB, LogMB, [State], RecoveryModel,
+             LastRestoreDate, RestoredFromServer, RestoredFromDatabase, RestoredBy, RestoreBackupMB, RestoreCompressedMB,
+             RestoreStartTime, RestoreCompletedTime, RestoreDurationSec, RestoreDuration, RestoreDurationSource, RestoreMBps,
+             RestoreDevice, RestoreFiles, SourceBackupSec, SourceBackupMBps, RestoreCount, MeasuredRestores,
+             LastFullBackupDate, LastFullBackupMB, LastFullBackupCompressedMB, LastFullBackupSec, BackupMBps, BackupDevice, BackupFiles,
+             BackupSamples, BackupMBpsMin, BackupMBpsMedian, BackupMBpsMax,
+             HostCPU, HostMemoryGB, InstantFileInit, VmType, SqlVersion, EngineEdition, SqlEdition)
+SELECT 'Database', @srv, d.name, sz.SizeMB, sz.DataMB, sz.LogMB, d.state_desc, d.recovery_model_desc,
+       ISNULL(CONVERT(varchar(19), r.StartTime, 120), 'No restore history'), r.FromServer, r.FromDatabase, r.RestoredBy,
+       r.BackupMB, r.CompressedMB, CONVERT(varchar(19), r.StartTime, 120), CONVERT(varchar(19), r.CompletedAt, 120), r.Sec,
+       CASE WHEN r.Sec IS NULL THEN NULL
+            ELSE CAST(r.Sec / 3600 AS varchar(10)) + ':' + RIGHT('0' + CAST((r.Sec % 3600) / 60 AS varchar(2)), 2)
+                 + ':' + RIGHT('0' + CAST(r.Sec % 60 AS varchar(2)), 2) END,
+       CASE WHEN r.StartTime IS NULL THEN 'No restore history' WHEN r.CompletedAt IS NOT NULL THEN 'ErrorLog' ELSE 'Not in error log' END,
+       CAST(r.BackupMB / NULLIF(r.Sec, 0) AS decimal(18,1)),
+       CASE r.DeviceType WHEN 2 THEN 'Disk' WHEN 102 THEN 'Disk' WHEN 9 THEN 'URL' WHEN 7 THEN 'Virtual device'
+                         WHEN 5 THEN 'Tape' WHEN 105 THEN 'Tape' ELSE CAST(r.DeviceType AS varchar(10)) END,
+       r.Files, r.SourceSec, CAST(r.BackupMB / NULLIF(r.SourceSec, 0) AS decimal(18,1)),
+       rc.N, rc.M,
+       CONVERT(varchar(19), b.backup_finish_date, 120),
+       CAST(b.backup_size / 1048576.0 AS decimal(18,1)),
+       CAST(b.compressed_backup_size / 1048576.0 AS decimal(18,1)),
+       DATEDIFF(SECOND, b.backup_start_date, b.backup_finish_date),
+       CAST(b.backup_size / 1048576.0 / NULLIF(DATEDIFF(SECOND, b.backup_start_date, b.backup_finish_date), 0) AS decimal(18,1)),
+       CASE bd.DeviceType WHEN 2 THEN 'Disk' WHEN 102 THEN 'Disk' WHEN 9 THEN 'URL' WHEN 7 THEN 'Virtual device'
+                          WHEN 5 THEN 'Tape' WHEN 105 THEN 'Tape' ELSE CAST(bd.DeviceType AS varchar(10)) END,
+       bd.Files,
+       s.BackupSamples, s.BackupMBpsMin, s.BackupMBpsMedian, s.BackupMBpsMax,
+       @cpu, @memGB, @ifi, @vmt, @ver, @eng, @ed
+FROM sys.databases d
+OUTER APPLY (SELECT SizeMB = SUM(CAST(mf.size AS bigint)) * 8 / 1024,
+                    DataMB = SUM(CASE WHEN mf.type = 1 THEN 0 ELSE CAST(mf.size AS bigint) END) * 8 / 1024,
+                    LogMB  = SUM(CASE WHEN mf.type = 1 THEN CAST(mf.size AS bigint) ELSE 0 END) * 8 / 1024
+             FROM sys.master_files mf WHERE mf.database_id = d.database_id) sz
+LEFT JOIN #lr r  ON r.DatabaseName  COLLATE DATABASE_DEFAULT = d.name COLLATE DATABASE_DEFAULT
+LEFT JOIN #lb b  ON b.database_name COLLATE DATABASE_DEFAULT = d.name COLLATE DATABASE_DEFAULT
+LEFT JOIN #bks s ON s.database_name COLLATE DATABASE_DEFAULT = d.name COLLATE DATABASE_DEFAULT
+OUTER APPLY (SELECT N = COUNT(*), M = SUM(CASE WHEN x.CompletedAt IS NOT NULL THEN 1 ELSE 0 END)
+             FROM #rs x WHERE x.DatabaseName COLLATE DATABASE_DEFAULT = d.name COLLATE DATABASE_DEFAULT) rc
+OUTER APPLY (SELECT DeviceType = MAX(f.device_type), Files = SUM(CASE WHEN ISNULL(f.mirror, 0) = 0 THEN 1 ELSE 0 END)
+             FROM msdb.dbo.backupmediafamily f WHERE f.media_set_id = b.media_set_id) bd
+WHERE d.database_id > 4                 -- skip master, tempdb, model, msdb
+  AND d.source_database_id IS NULL;     -- skip database snapshots
+
+INSERT #out (RowType, ServerName, DatabaseName, LastRestoreDate, RestoredFromServer, RestoredFromDatabase, RestoredBy,
+             RestoreBackupMB, RestoreCompressedMB, RestoreStartTime, RestoreCompletedTime, RestoreDurationSec, RestoreDuration,
+             RestoreDurationSource, RestoreMBps, RestoreDevice, RestoreFiles, SourceBackupSec, SourceBackupMBps,
+             HostCPU, HostMemoryGB, InstantFileInit, VmType, SqlVersion, EngineEdition, SqlEdition)
+SELECT 'Restore', @srv, x.DatabaseName, CONVERT(varchar(19), x.StartTime, 120), x.FromServer, x.FromDatabase, x.RestoredBy,
+       x.BackupMB, x.CompressedMB, CONVERT(varchar(19), x.StartTime, 120), CONVERT(varchar(19), x.CompletedAt, 120), x.Sec,
+       CAST(x.Sec / 3600 AS varchar(10)) + ':' + RIGHT('0' + CAST((x.Sec % 3600) / 60 AS varchar(2)), 2)
+         + ':' + RIGHT('0' + CAST(x.Sec % 60 AS varchar(2)), 2),
+       'ErrorLog', CAST(x.BackupMB / NULLIF(x.Sec, 0) AS decimal(18,1)),
+       CASE x.DeviceType WHEN 2 THEN 'Disk' WHEN 102 THEN 'Disk' WHEN 9 THEN 'URL' WHEN 7 THEN 'Virtual device'
+                         WHEN 5 THEN 'Tape' WHEN 105 THEN 'Tape' ELSE CAST(x.DeviceType AS varchar(10)) END,
+       x.Files, x.SourceSec, CAST(x.BackupMB / NULLIF(x.SourceSec, 0) AS decimal(18,1)),
+       @cpu, @memGB, @ifi, @vmt, @ver, @eng, @ed
+FROM #rs x
+WHERE x.Sec > 0;
+
+SELECT * FROM #out ORDER BY RowType, DatabaseName, RestoreStartTime;
+</script>
+<script type="text/plain" id="src-ps">
+<# MTTR Intelligence - restore & backup history runner
+   Runs Restore_History_All.sql on every server below and writes ONE file for the report.
+   Needs : SqlServer module (Invoke-Sqlcmd)  ->  Install-Module SqlServer -Scope CurrentUser
+   Output: RestoreHistory_All_<date>.xlsx with the ImportExcel module, else via Microsoft Excel,
+           else .csv - the report accepts .xlsx and .csv.
+   Azure SQL MI is not listed: its restores are platform-managed.
+   Comment out (#) any server you do not want to query. #>
+$servers = @(
+__SERVERLIST__
+)
+$here    = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$sqlFile = Join-Path $here 'Restore_History_All.sql'
+if (-not (Test-Path -LiteralPath $sqlFile)) { throw "Save the T-SQL from the report as $sqlFile first." }
+$sql   = Get-Content -LiteralPath $sqlFile -Raw
+$stamp = '{0:yyyyMMdd_HHmm}' -f (Get-Date)
+$xlsx  = Join-Path $here "RestoreHistory_All_$stamp.xlsx"
+$cols  = 'RowType','ServerName','CollectedFrom','DatabaseName','SizeMB','DataMB','LogMB','State','RecoveryModel',
+         'LastRestoreDate','RestoredFromServer','RestoredFromDatabase','RestoredBy','RestoreBackupMB','RestoreCompressedMB',
+         'RestoreStartTime','RestoreCompletedTime','RestoreDurationSec','RestoreDuration','RestoreDurationSource','RestoreMBps',
+         'RestoreDevice','RestoreFiles','SourceBackupSec','SourceBackupMBps','RestoreCount','MeasuredRestores',
+         'LastFullBackupDate','LastFullBackupMB','LastFullBackupCompressedMB','LastFullBackupSec','BackupMBps','BackupDevice','BackupFiles',
+         'BackupSamples','BackupMBpsMin','BackupMBpsMedian','BackupMBpsMax',
+         'HostCPU','HostMemoryGB','InstantFileInit','VmType','SqlVersion','EngineEdition','SqlEdition'
+$text  = 'RowType','ServerName','CollectedFrom','DatabaseName','State','RecoveryModel','LastRestoreDate','RestoredFromServer',
+         'RestoredFromDatabase','RestoredBy','RestoreStartTime','RestoreCompletedTime','RestoreDuration','RestoreDurationSource',
+         'RestoreDevice','LastFullBackupDate','BackupDevice','InstantFileInit','VmType','SqlVersion','SqlEdition'
+$cmd = Get-Command Invoke-Sqlcmd -ErrorAction Stop
+$tsc = $cmd.Parameters.ContainsKey('TrustServerCertificate')
+$rows = foreach ($s in $servers) {
+  Write-Host "-> $s"
+  try {
+    $p = @{ ServerInstance = $s; Query = $sql; QueryTimeout = 900; ConnectionTimeout = 15; ErrorAction = 'Stop' }
+    if ($tsc) { $p.TrustServerCertificate = $true }
+    $n = 0
+    foreach ($r in @(Invoke-Sqlcmd @p)) {
+      $o = [ordered]@{}
+      foreach ($c in $cols) {
+        $v = $null
+        if ($c -eq 'CollectedFrom') { $v = $s } elseif ($r.Table.Columns.Contains($c)) { $v = $r[$c] }
+        $o[$c] = if ($v -is [DBNull]) { $null } else { $v }
+      }
+      $n++
+      [pscustomobject]$o
+    }
+    Write-Host "   $n rows"
+  } catch { Write-Warning "$s : $($_.Exception.Message)" }
+}
+if (-not $rows) { Write-Warning 'No rows returned - nothing written.'; return }
+$out = $xlsx
+if (Get-Module -ListAvailable -Name ImportExcel) {
+  Import-Module ImportExcel
+  $rows | Export-Excel -Path $xlsx -WorksheetName 'RestoreHistory' -TableName 'RestoreHistory' -AutoSize -FreezeTopRow -NoNumberConversion $text
+} else {
+  $csv = [IO.Path]::ChangeExtension($xlsx, 'csv')
+  $rows | Export-Csv $csv -NoTypeInformation -Encoding UTF8
+  $out = $csv
+  try {
+    Write-Host 'ImportExcel not found - converting with Microsoft Excel'
+    $xl = New-Object -ComObject Excel.Application; $xl.DisplayAlerts = $false
+    try { $wb = $xl.Workbooks.Open($csv); $wb.SaveAs($xlsx, 51); $wb.Close($false); $out = $xlsx; Remove-Item $csv }
+    finally { $xl.Quit(); [void][Runtime.InteropServices.Marshal]::ReleaseComObject($xl) }
+  } catch { Write-Warning "Excel not available - keeping the CSV (the report accepts it): $csv" }
+}
+Write-Host "Done -> $out ($(@($rows).Count) rows)" -ForegroundColor Green
+</script>
+<script>
+'use strict';
+/* ============================================================ data */
+const D = __DATA__;
+const HIST0 = __HIST__;
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = v => { if (v == null || v === '') return null; const n = parseFloat(String(v).replace(/,/g, '')); return isFinite(n) ? n : null; };
+const short = s => String(s ?? '').trim().replace(/^tcp:/i, '').replace(/,\d+$/, '').replace(/\.database\.windows\.net$/i, '').split('\\').map((p, i) => i ? p : p.split('.')[0]).join('\\').toUpperCase();
+const arr = v => Array.isArray(v) ? v.filter(Boolean) : v ? [v] : [];
+D.prod = D.prod || []; D.off = D.off || []; D.servers = D.servers || {};
+D.prod.forEach(x => {
+  x.srvs = arr(x.srvs); if (!x.srvs.length) x.srvs = [x.srv];
+  x.apps = arr(x.apps); if (!x.apps.length) x.apps = [x.app || '(Unassigned)']; x.app = x.app || x.apps[0];
+  x.drs = arr(x.drs); if (!x.drs.length && x.dr) x.drs = [x.dr]; x.dr = x.dr || x.drs[0] || '';
+});
+
+/* ============================================================ formatting */
+const fmtMB = m => m == null || !isFinite(m) ? '—' : m >= 1048576 ? (m / 1048576).toFixed(2) + ' TB' : m >= 1024 ? (m / 1024).toFixed(1) + ' GB' : Math.round(m) + ' MB';
+const fmtMin = m => m == null || !isFinite(m) ? '—' : m < 1 ? '<1 min' : m < 90 ? Math.round(m) + ' min' : m < 2880 ? (m / 60).toFixed(1) + ' h' : (m / 1440).toFixed(1) + ' d';
+const fmtT = m => m <= 0 ? '0' : fmtMin(m);
+function fmtRng(a, b) {
+  if (a == null || b == null || !isFinite(a) || !isFinite(b) || Math.abs(b - a) < 0.5) return '';
+  const u = b < 90 ? 'min' : b < 2880 ? 'h' : 'd';
+  const f = v => u === 'min' ? (v < 1 ? '<1' : Math.round(v)) : u === 'h' ? (v / 60).toFixed(1) : (v / 1440).toFixed(1);
+  return `${f(a)}–${f(b)} ${u}`;
+}
+const r0 = v => v == null || !isFinite(v) ? '—' : v >= 10 ? Math.round(v).toLocaleString('en-US') : v.toFixed(1);
+const fmtRate = r => r == null || !isFinite(r) ? '—' : r0(r) + ' MB/s';
+const fmtDur = s => { s = Math.round(s); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60; return `${h}:${String(m).padStart(2, '0')}:${String(x).padStart(2, '0')}`; };
+const plural = (n, w) => `${Number(n).toLocaleString('en-US')} ${w}${n === 1 ? '' : 's'}`;
+const sum = (L, f) => L.reduce((a, x) => a + (f(x) || 0), 0);
+
+/* ============================================================ state */
+const DEF = 200;
+const S = { ovh: 2, streams: 1, basis: 'backup', order: 'lpt', minGB: 1, excl: false, side: 'P', k: 0.75 };
+const MAN = {};
+// internal basis -> what the user sees
+const KIND = b => b === 'actual' || b === 'server' ? 'meas' : b === 'manual' ? 'man' : b === 'assumed' ? 'asm' : 'est';
+const KN = { meas: 'Measured', est: 'Estimated', asm: 'Assumed', man: 'Manual' };
+const KTIP = { meas: 'Timed restores on this server', est: "From this server's backups, similar servers or the estate", asm: '200 MB/s placeholder - no evidence yet', man: 'Throughput you picked' };
+const KORDER = ['meas', 'est', 'asm', 'man'];
+const PAL = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#6250d6'], OTHER = '#aab2bd';
+let H = null, SI = {}, PROF0 = {}, PROF = {}, CAL = null, EST = null, ESTB = null, SPEC = {};
+let ROWS = [], TLP = null, VIEW = null;
+const XP = { imp: [], thr: [], topo: [], col: [] };
+const reg = (tab, fn) => tab + ':' + (XP[tab].push(fn) - 1);
+const infoX = (tab, fn, lbl) => `<button class="info" data-x="${reg(tab, fn)}" aria-label="${esc(lbl || 'Rationale')}" title="Rationale">i</button>`;
+const PRODSET = new Set(D.prod.flatMap(x => x.srvs)), DRSET = new Set(D.prod.flatMap(x => x.drs));
+const APPS = [...new Set(D.prod.flatMap(x => x.apps))].sort((a, b) => a.localeCompare(b));
+const AGS = [...new Set(D.prod.filter(x => x.ag !== 'NA').map(x => x.ag))].map(ag => {
+  const L = D.prod.filter(x => x.ag === ag);
+  return { ag, L, app: [...new Set(L.flatMap(x => x.apps))], nodes: [...new Set(L.flatMap(x => x.srvs))].sort(), dr: [...new Set(L.flatMap(x => x.drs))].sort(), n: L.length, mb: L.reduce((a, x) => a + x.mb, 0) };
+}).sort((a, b) => b.nodes.length + b.dr.length - (a.nodes.length + a.dr.length) || b.mb - a.mb);
+// colour coding: Availability Group / standalone with a DR copy / standalone without DR
+const AGNODES = new Set(AGS.flatMap(a => a.nodes.concat(a.dr))), CAT = {};
+function catOf(s) {
+  if (s in CAT) return CAT[s];
+  if (AGNODES.has(s)) return (CAT[s] = 'ag');
+  if (!PRODSET.has(s)) return (CAT[s] = DRSET.has(s) ? 'dr' : '');
+  return (CAT[s] = D.prod.some(x => x.ag === 'NA' && x.srvs.includes(s) && x.drs.length) ? 'dr' : 'nodr');
+}
+const CATN = { ag: 'Availability Group', dr: 'Standalone with a DR copy', nodr: 'Standalone without a DR copy' };
+const CATS = { ag: 'AG', dr: 'Standalone · DR', nodr: 'Standalone · no DR' };
+const catPill = s => { const c = catOf(s); return c ? `<span class="catp ${c}" title="${CATN[c]}">${CATS[c]}</span>` : ''; };
+const CATLG = `<span class="lgc"><i class="cat ag"></i>Availability Group</span><span class="lgc"><i class="cat dr"></i>Standalone with DR copy</span><span class="lgc"><i class="cat nodr"></i>Standalone without DR copy</span>`;
+
+/* ============================================================ statistics */
+function quant(a, p) { const n = a.length; if (!n) return null; const i = (n - 1) * p, lo = Math.floor(i), hi = Math.ceil(i); return a[lo] + (a[hi] - a[lo]) * (i - lo); }
+function stats(v) { const a = v.filter(x => x > 0 && isFinite(x)).sort((x, y) => x - y); if (!a.length) return null; return { n: a.length, min: a[0], p25: quant(a, .25), med: quant(a, .5), p75: quant(a, .75), max: a[a.length - 1] }; }
+
+/* ============================================================ server facts */
+const VER = { 10: '2008/R2', 11: '2012', 12: '2014', 13: '2016', 14: '2017', 15: '2019', 16: '2022', 17: '2025' };
+const verName = v => { const m = String(v || '').match(/^(\d+)\./); return m && VER[+m[1]] ? VER[+m[1]] : String(v || ''); };
+const sqlv = v => !v ? '' : /^\d/.test(String(v)) ? 'SQL ' + v : String(v);
+const EDN = e => { e = String(e || '').trim(); return !e ? '' : /enterprise/i.test(e) ? 'Enterprise' : /standard/i.test(e) ? 'Standard' : /developer/i.test(e) ? 'Developer' : /express/i.test(e) ? 'Express' : /\bweb\b/i.test(e) ? 'Web' : /evaluation/i.test(e) ? 'Evaluation' : /azure|managed/i.test(e) ? 'Azure SQL MI' : e; };
+const miTier = v => /business\s*critical/i.test(v || '') ? 'Business Critical' : /general\s*purpose/i.test(v || '') ? 'General Purpose' : '';
+function spec(s) {
+  if (SPEC[s]) return SPEC[s];
+  const v = D.servers[s] || {}, h = SI[s] || {};
+  let pc = v.pc || '', pl = v.pl || '';
+  if (!pc && h.eng === 8) { pc = 'PaaS'; pl = 'PaaS · Azure SQL MI'; }
+  if (pc === 'OnPrem' && pl === 'On-prem' && h.vmt) pl = /hyper/i.test(h.vmt) ? 'On-prem VM' : /^none$/i.test(h.vmt) ? 'On-prem physical' : pl;
+  const vm = v.vm && !/^(unknown|n\/?a|-|none|null)$/i.test(String(v.vm).trim()) ? String(v.vm).trim() : '';
+  const ed = pc === 'PaaS' ? (miTier(vm) ? 'Azure SQL MI · ' + miTier(vm) : 'Azure SQL MI')
+    : EDN(v.ed) || EDN(h.edn) || (h.eng === 2 ? 'Standard' : h.eng === 4 ? 'Express' : h.eng === 3 ? 'Enterprise / Developer' : '');
+  return (SPEC[s] = { cpu: v.cpu || h.cpu || 0, mem: v.mem || h.mem || 0, vm, loc: v.loc || '', ver: v.ver || verName(h.ver), pc, pl, raw: v.plat || '', ed,
+    env: v.env || (H && (H.bySrv[s] || H.ev[s]) ? 'History' : ''), ifi: h.ifi || '' });
+}
+const specTxt = s => { const p = spec(s); return `${p.cpu || '—'} vCPU · ${p.mem ? p.mem + ' GB' : '—'}${p.vm ? ' · ' + esc(p.vm) : ''}`; };
+const PFC = { IaaS: 'pf-i', PaaS: 'pf-p', OnPrem: 'pf-o' };
+function pfPill(s) {
+  const p = spec(s);
+  if (!p.pl) return '<span class="pf" title="No Platform value for this server in the inventory"><i></i>platform n/a</span>';
+  return `<span class="pf ${PFC[p.pc] || ''}" title="${esc(p.raw ? 'Platform in inventory: ' + p.raw : 'Platform inferred from VM size / server name / SQL Server')}"><i></i>${esc(p.pl)}</span>`;
+}
+const envPill = e => e ? `<span class="pill ${e === 'PROD' ? 'p-prod' : e === 'DR' ? 'p-dr' : 'p-oth'}">${esc(e)}</span>` : '';
+const badge = b => { const k = KIND(b); return `<span class="bd ${k}" title="${KTIP[k]}">${KN[k]}</span>`; };
+const confPill = c => `<span class="cf cf-${String(c).toLowerCase()}">${esc(c)}</span>`;
+
+/* ============================================================ restore history ingest */
+const COLS = ['RowType', 'ServerName', 'CollectedFrom', 'DatabaseName', 'SizeMB', 'DataMB', 'LogMB', 'State', 'RecoveryModel', 'LastRestoreDate', 'RestoredFromServer', 'RestoredFromDatabase', 'RestoredBy', 'RestoreBackupMB', 'RestoreCompressedMB', 'RestoreStartTime', 'RestoreCompletedTime', 'RestoreDurationSec', 'RestoreDuration', 'RestoreDurationSource', 'RestoreMBps', 'RestoreSeconds', 'RestoreDevice', 'RestoreFiles', 'SourceBackupSec', 'SourceBackupMBps', 'RestoreCount', 'MeasuredRestores', 'LastFullBackupDate', 'LastFullBackupMB', 'LastFullBackupCompressedMB', 'LastFullBackupSec', 'BackupMBps', 'BackupDevice', 'BackupFiles', 'BackupSamples', 'BackupMBpsMin', 'BackupMBpsMedian', 'BackupMBpsMax', 'HostCPU', 'HostMemoryGB', 'InstantFileInit', 'VmType', 'SqlVersion', 'EngineEdition', 'SqlEdition'];
+const CANON = {}; COLS.forEach(k => CANON[k.toLowerCase()] = k);
+const canon = h => { const k = String(h ?? '').trim(); return CANON[k.toLowerCase().replace(/[^a-z0-9]/g, '')] || k; };
+const DATE_COLS = ['LastRestoreDate', 'RestoreStartTime', 'RestoreCompletedTime', 'LastFullBackupDate'];
+function xlDate(v) {
+  v = String(v ?? '').trim(); if (!v) return '';
+  if (/^\d{5}(\.\d+)?$/.test(v)) { const d = new Date(Math.round((+v - 25569) * 86400000)); return isNaN(d) ? v : d.toISOString().replace('T', ' ').slice(0, 19); }
+  if (/^\d{4}-\d\d-\d\d/.test(v)) return v.replace('T', ' ').slice(0, 19);
+  if (/^\d{1,2}\/\d{1,2}\/\d{4}/.test(v)) { const d = new Date(v); if (!isNaN(d)) { const p = n => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`; } }
+  return v;
+}
+const qualifies = e => e.mb >= S.minGB * 1024 && e.sec >= 10;
+function mkEvent(o, s) {
+  const sec = num(o.RestoreDurationSec) ?? num(o.RestoreSeconds), mb = num(o.RestoreBackupMB);
+  if (!(sec > 0 && mb > 0)) return null;
+  const ss = num(o.SourceBackupSec);
+  return { s, db: o.DatabaseName, mb, cmb: num(o.RestoreCompressedMB), sec, rate: mb / sec, start: o.RestoreStartTime || o.LastRestoreDate || '', end: o.RestoreCompletedTime || '',
+    from: o.RestoredFromServer || '', fromDb: o.RestoredFromDatabase || '', by: o.RestoredBy || '', dev: o.RestoreDevice || '', files: num(o.RestoreFiles), srcRate: ss > 0 ? mb / ss : null };
+}
+function ingest(objs, name, cols) {
+  const h = { name, rows: objs.length, db: {}, ev: {}, bySrv: {}, si: {}, dbRows: 0, evRows: 0, legacy: false, bad: 0, dup: 0, hasBk: (cols || []).includes('BackupSamples') };
+  const seen = new Set();
+  objs.forEach(o => {
+    for (const k in o) if (typeof o[k] === 'string' && /^\s*null\s*$/i.test(o[k])) o[k] = '';   // SSMS grid exports write NULL as text
+    if (!o.ServerName || !o.DatabaseName) { h.bad++; return; }
+    DATE_COLS.forEach(k => { if (k in o) o[k] = xlDate(o[k]); });
+    const a = short(o.ServerName), b = o.CollectedFrom ? short(o.CollectedFrom) : '';
+    const s = D.servers[a] ? a : b && D.servers[b] ? b : a;
+    o._s = s;
+    if (/^restore/i.test(String(o.RowType || '').trim())) {
+      const e = mkEvent(o, s); if (!e) return;
+      const k = s + '|' + e.db.toLowerCase() + '|' + e.start; if (seen.has(k)) { h.dup++; return; } seen.add(k);
+      (h.ev[s] = h.ev[s] || []).push(e); h.evRows++; return;
+    }
+    h.db[s + '|' + o.DatabaseName.toLowerCase()] = o; (h.bySrv[s] = h.bySrv[s] || []).push(o); h.dbRows++;
+    const si = h.si[s] = h.si[s] || {}, c = num(o.HostCPU), m = num(o.HostMemoryGB), en = num(o.EngineEdition);
+    if (c) si.cpu = c; if (m) si.mem = Math.round(m); if (en) si.eng = en;
+    if (o.InstantFileInit) si.ifi = o.InstantFileInit; if (o.VmType) si.vmt = o.VmType; if (o.SqlVersion) si.ver = o.SqlVersion; if (o.SqlEdition) si.edn = o.SqlEdition;
+  });
+  if (!h.evRows) { // older collector file: one (latest) restore per database row
+    h.legacy = true;
+    Object.values(h.db).forEach(o => { const e = mkEvent(o, o._s); if (e) (h.ev[o._s] = h.ev[o._s] || []).push(e); });
+  }
+  H = h; SI = h.si; recompute();
+}
+
+/* ============================================================ throughput profiles */
+function backupStats(s) {
+  const L = H && H.bySrv[s]; if (!L) return null; const per = [];
+  L.forEach(o => {
+    if (H.hasBk) { const n = num(o.BackupSamples), md = num(o.BackupMBpsMedian); if (n > 0 && md > 0) { per.push({ db: o.DatabaseName, n, min: num(o.BackupMBpsMin) ?? md, med: md, max: num(o.BackupMBpsMax) ?? md }); return; } }
+    const bm = num(o.LastFullBackupMB), bs = num(o.LastFullBackupSec);   // otherwise the latest full backup of the database
+    if (bm >= S.minGB * 1024 && bs >= 10) per.push({ db: o.DatabaseName, n: 1, min: bm / bs, med: bm / bs, max: bm / bs });
+  });
+  if (!per.length) return null;
+  return { dbs: per.length, n: per.reduce((a, p) => a + p.n, 0), min: Math.min(...per.map(p => p.min)), max: Math.max(...per.map(p => p.max)), med: quant(per.map(p => p.med).sort((a, b) => a - b), .5), per };
+}
+function universe() { const U = new Set(Object.keys(D.servers)); if (H) { Object.keys(H.ev).forEach(s => U.add(s)); Object.keys(H.bySrv).forEach(s => U.add(s)); } return [...U]; }
+// restore speed as a share of backup speed: measured when timed restores and backups overlap, otherwise the assumed value S.k
+const kRat = () => CAL ? { k: CAL.st.med, lo: CAL.st.p25, hi: CAL.st.p75, src: 'measured' } : { k: S.k, lo: S.k, hi: S.k, src: 'assumed' };
+function recompute() {
+  SPEC = {}; PROF0 = {};
+  universe().forEach(s => { const all = (H && H.ev[s]) || [], sm = all.filter(qualifies); PROF0[s] = { sm, own: stats(sm.map(e => e.rate)), small: all.length - sm.length, bk: backupStats(s) }; });
+  EST = stats(Object.values(PROF0).flatMap(p => p.sm.map(e => e.rate)));
+  const per = Object.values(PROF0).filter(p => p.bk).flatMap(p => p.bk.per);
+  ESTB = per.length ? Object.assign(stats(per.map(p => p.med)), { nBk: per.reduce((a, p) => a + p.n, 0), nSrv: Object.values(PROF0).filter(p => p.bk).length }) : null;
+  CAL = calibrate();
+  PROF = {}; Object.keys(PROF0).forEach(s => PROF[s] = choose(s));
+}
+function calibrate() {
+  if (!H) return null;
+  const A = Object.entries(PROF0).filter(([, p]) => p.own && p.bk && p.bk.med > 0).map(([s, p]) => ({ s, r: p.own.med, b: p.bk.med, k: p.own.med / p.bk.med, n: p.own.n })).filter(p => p.k > 0.02 && p.k < 20);
+  if (A.length >= 2) return { method: 'server', pairs: A, st: stats(A.map(p => p.k)) };
+  const B = Object.values(H.ev).flat().filter(e => qualifies(e) && e.srcRate > 0).map(e => ({ s: e.s, db: e.db, r: e.rate, b: e.srcRate, k: e.rate / e.srcRate })).filter(p => p.k > 0.02 && p.k < 20);
+  if (B.length >= 3) return { method: 'backupset', pairs: B, st: stats(B.map(p => p.k)) };
+  return null;
+}
+const normVm = v => String(v || '').trim().toLowerCase().replace(/^standard_/, '').replace(/\s+/g, '');
+const TIERS = [
+  ['Identical VM size', (a, b) => !!a.vm && !!b.vm && normVm(a.vm) === normVm(b.vm)],
+  ['Same vCPU and similar memory', (a, b) => a.cpu > 0 && a.cpu === b.cpu && a.mem > 0 && b.mem > 0 && Math.abs(b.mem / a.mem - 1) <= 0.25],
+  ['Same vCPU', (a, b) => a.cpu > 0 && a.cpu === b.cpu],
+  ['Comparable vCPU (½×–2×)', (a, b) => a.cpu > 0 && b.cpu >= a.cpu / 2 && b.cpu <= a.cpu * 2]
+];
+// backup samples of a peer group -> restore estimate (x restore/backup ratio); the raw backup figures are kept for display
+function bkStats(per, kr) {
+  const raw = { n: per.reduce((a, p) => a + p.n, 0), min: Math.min(...per.map(p => p.min)), med: quant(per.map(p => p.med).sort((a, b) => a - b), .5), max: Math.max(...per.map(p => p.max)) };
+  return { raw, st: { n: raw.n, min: kr.lo * raw.min, med: kr.k * raw.med, max: kr.hi * raw.max } };
+}
+// similar servers, tightest match first; within a tier timed restores are preferred over backups
+function peerGroup(s) {
+  const me = spec(s), same = x => { const p = spec(x).pc; return !me.pc || !p || p === me.pc; };
+  const R = Object.keys(PROF0).filter(x => x !== s && PROF0[x].own), B = Object.keys(PROF0).filter(x => x !== s && PROF0[x].bk);
+  if (!R.length && !B.length) return null;
+  for (let i = 0; i < TIERS.length; i++) {
+    const [label, f] = TIERS[i], match = x => same(x) && f(me, spec(x));
+    const LR = R.filter(match);
+    if (LR.length) return { tier: i + 1, label, kind: 'restore', servers: LR.sort(), st: stats(LR.flatMap(x => PROF0[x].sm.map(e => e.rate))) };
+    const LB = B.filter(match);
+    if (LB.length) return Object.assign({ tier: i + 1, label, kind: 'backup', servers: LB.sort() }, bkStats(LB.flatMap(x => PROF0[x].bk.per), kRat()));
+  }
+  return null;
+}
+const lcf = t => t.charAt(0).toLowerCase() + t.slice(1);
+function tierTxt(g, s) {   // the resource match in words, e.g. "identical VM size Standard_E48ds_v4"
+  const me = spec(s);
+  return g.tier === 1 ? `identical VM size ${me.vm}` : g.tier === 2 ? `${me.cpu} vCPU and similar memory (${me.mem} GB ±25%)` : g.tier === 3 ? `${me.cpu} vCPU` : `comparable compute (${Math.ceil(me.cpu / 2)}–${me.cpu * 2} vCPU)`;
+}
+// fewer than 3 samples: widen the range to at least the estate's interquartile spread around the planning value
+function band(plan, n, lo, hi) {
+  const ref = EST && EST.n >= 5 ? EST : ESTB && ESTB.n >= 5 ? ESTB : null;
+  if (n >= 3 || !ref) return { lo, hi, thin: false };
+  const l = plan * ref.p25 / ref.med, h = plan * ref.p75 / ref.med;
+  return { lo: Math.min(lo, l), hi: Math.max(hi, h), thin: l < lo - 1e-9 || h > hi + 1e-9 };
+}
+// evidence order: timed restores on the server > its own backups > similar servers > estate > 200 MB/s placeholder
+function choose(s) {
+  const e = PROF0[s] || { sm: [], own: null, small: 0, bk: null }, kr = kRat();
+  const P = { s, sm: e.sm, own: e.own, small: e.small, bk: e.bk, peer: peerGroup(s), bkEst: null, warn: '' };
+  if (e.bk) P.bkEst = { k: kr.k, src: kr.src, min: kr.lo * e.bk.min, med: kr.k * e.bk.med, max: kr.hi * e.bk.max };
+  let a;
+  if (e.own) { const b = band(e.own.med, e.own.n, e.own.min, e.own.max); a = { basis: 'server', plan: e.own.med, lo: b.lo, hi: b.hi, thin: b.thin, n: e.own.n, conf: e.own.n >= 3 ? 'High' : 'Medium' }; }
+  else if (P.bkEst) { const b = band(P.bkEst.med, e.bk.n, P.bkEst.min, P.bkEst.max); a = { basis: 'backup', plan: P.bkEst.med, lo: b.lo, hi: b.hi, thin: b.thin, n: e.bk.n, conf: kr.src === 'measured' ? 'Medium' : 'Low' }; }
+  else if (P.peer) { const st = P.peer.st, b = band(st.med, st.n, st.min, st.max); a = { basis: 'peer', plan: st.med, lo: b.lo, hi: b.hi, thin: b.thin, n: st.n, conf: P.peer.tier <= 2 && P.peer.kind === 'restore' ? 'Medium' : 'Low' }; }
+  else if (EST) a = { basis: 'estate', est: 'restore', plan: EST.med, lo: EST.p25, hi: EST.p75, conf: 'Low' };
+  else if (ESTB) a = { basis: 'estate', est: 'backup', plan: kr.k * ESTB.med, lo: kr.lo * ESTB.p25, hi: kr.hi * ESTB.p75, conf: 'Low' };
+  else a = { basis: 'assumed', plan: DEF, lo: DEF, hi: DEF, conf: 'None' };
+  P.auto = a;
+  if (a.basis === 'backup' && P.peer && P.peer.kind === 'restore' && P.peer.tier <= 2) { const r = P.peer.st.med / P.bkEst.med; if (r > 2 || r < 0.5) P.warn = `This server's backup-based estimate (${fmtRate(P.bkEst.med)}) and timed restores on similar servers (${fmtRate(P.peer.st.med)}) differ by ${(r > 1 ? r : 1 / r).toFixed(1)}× — confirm with a test restore.`; }
+  Object.assign(P, MAN[s] != null ? { basis: 'manual', plan: MAN[s], lo: MAN[s], hi: MAN[s], conf: 'Manual' } : a);
+  return P;
+}
+const prof = s => PROF[s] || (PROF[s] = choose(s));
+
+/* ============================================================ restore time model */
+function vol(x) {
+  let bk = null, log = null;
+  if (H) [...x.srvs, ...x.drs].forEach(s => {
+    const o = H.db[s + '|' + x.db.toLowerCase()]; if (!o) return;
+    const mb = num(o.LastFullBackupMB), lg = num(o.LogMB);
+    if (lg > 0 && x.srvs.includes(s)) log = Math.max(log || 0, lg);
+    if (mb > 0) { const dt = o.LastFullBackupDate || ''; if (!bk || dt > bk.dt) bk = { mb, dt, s, cmb: num(o.LastFullBackupCompressedMB) }; }
+  });
+  return S.basis === 'backup' && bk ? { V: bk.mb, src: 'backup', bk, log } : { V: x.mb, src: 'alloc', bk, log };
+}
+function dbTime(x, side, pref) {
+  const s = side === 'P' ? (x.srvs.includes(pref) ? pref : x.srvs[0]) : (x.drs.includes(pref) ? pref : x.dr);
+  return s ? dbTimeOn(x, s, side) : null;
+}
+// restore of database x on server s, whether or not s holds a copy today ("what if we restore it on this replica")
+function dbTimeOn(x, s, side) {
+  const P = prof(s), v = vol(x);
+  const own = MAN[s] == null && H ? (H.ev[s] || []).filter(e => e.db.toLowerCase() === x.db.toLowerCase()) : [];
+  let o;
+  if (own.length) { const st = stats(own.map(e => e.rate)), b = band(st.med, st.n, st.min, st.max); o = { basis: 'actual', rate: st.med, hiR: b.hi, loR: b.lo, conf: 'High', own, st }; }
+  else o = { basis: P.basis, rate: P.plan, hiR: P.hi, loR: P.lo, conf: P.conf };
+  return Object.assign(o, { x, side, s, P, v, t: v.V / o.rate / 60, best: v.V / o.hiR / 60, worst: v.V / o.loR / 60 });
+}
+function plan(items) {
+  const all = items.filter(Boolean), L = S.excl ? all.filter(it => !it.x.copy) : all;
+  const k = Math.max(1, S.streams | 0);
+  const sorted = [...L].sort(S.order === 'spt' ? (a, b) => a.t - b.t : (a, b) => b.t - a.t);
+  // per-server ceiling: restores running on the same server together never exceed the top of its throughput range
+  const cap = new Map();
+  L.forEach(it => { const P = prof(it.s); cap.set(it.s, Math.max(cap.get(it.s) || 0, P.hi || 0, (P.auto && P.auto.hi) || 0, it.hiR || 0, it.rate || 0)); });
+  const RK = { t: 'rate', best: 'hiR', worst: 'loR' };
+  // event simulation: each stream takes the next database when it frees up; the overhead runs at full speed;
+  // work is in minutes at full single-restore speed, slowed only while the server's ceiling is exceeded
+  const run = key => {
+    const queue = sorted.slice(), active = [], seq = [], ovh = S.ovh, rk = RK[key];
+    let t = 0, guard = 0;
+    const next = lane => { const it = queue.shift(); if (it) active.push({ it, lane, start: t, ph: ovh > 0 ? 'o' : 'r', rem: ovh > 0 ? ovh : it[key] }); };
+    for (let i = 0; i < k; i++) next(i);
+    while (active.length && guard++ < 1e6) {
+      const dem = new Map(); active.forEach(a => { if (a.ph === 'r') dem.set(a.it.s, (dem.get(a.it.s) || 0) + (a.it[rk] || 0)); });
+      const phi = active.map(a => { if (a.ph !== 'r') return 1; const d = dem.get(a.it.s), c = cap.get(a.it.s); return c > 0 && d > c ? c / d : 1; });
+      let dt = Infinity;
+      active.forEach((a, i) => { dt = Math.min(dt, a.ph === 'o' ? a.rem : a.rem / phi[i]); });
+      if (!isFinite(dt)) break;
+      t += dt;
+      for (let i = active.length - 1; i >= 0; i--) {
+        const a = active[i];
+        a.rem -= a.ph === 'o' ? dt : dt * phi[i];
+        if (a.rem > 1e-9) continue;
+        if (a.ph === 'o' && a.it[key] > 1e-9) { a.ph = 'r'; a.rem = a.it[key]; continue; }
+        active.splice(i, 1); seq.push({ it: a.it, lane: a.lane, start: a.start, end: t }); next(a.lane);
+      }
+    }
+    return { total: t, seq };
+  };
+  const mix = {}; L.forEach(it => { const kk = KIND(it.basis); mix[kk] = (mix[kk] || 0) + 1; });
+  return { n: L.length, excluded: all.length - L.length, k, cap, typ: run('t'), best: run('best'), worst: run('worst'), mix, vol: L.reduce((a, it) => a + it.v.V, 0) };
+}
+const mixTxt = mix => KORDER.filter(b => mix[b]).map(b => `<span class="mx"><i class="dot d-${b}"></i>${mix[b]} ${KN[b].toLowerCase()}</span>`).join('');
+// every database whose restore target is server s (PROD copy on s, or DR copy on s), restored one after another
+function srvLoad(s) {
+  const L = [];
+  D.prod.forEach(x => { if (x.srvs.includes(s)) L.push(dbTime(x, 'P', s)); else if (x.drs.includes(s)) L.push(dbTime(x, 'R', s)); });
+  const I = L.filter(Boolean);
+  return { n: I.length, vol: sum(I, o => o.v.V), t: sum(I, o => o.t), best: sum(I, o => o.best), worst: sum(I, o => o.worst) };
+}
+
+/* ============================================================ modal */
+function openModal(o) {
+  $('#mbox').className = 'mbox ' + (o.cls || '');
+  $('#mt').textContent = o.title; $('#ms').textContent = o.sub || ''; $('#mb').innerHTML = o.html;
+  $('#mdl').hidden = false; $('#mbox').scrollTop = 0; $('#mx').focus();
+}
+const closeModal = () => { $('#mdl').hidden = true; };
+const KV = (a, b) => `<tr><td>${a}</td><td>${b}</td></tr>`;
+
+/* ============================================================ rationale text */
+// one sentence: why this throughput was recommended for server s
+const kTxt = () => { const kr = kRat(); return `${Math.round(kr.k * 100)}% of backup speed (${kr.src === 'measured' ? 'measured on this estate' : 'assumed — no timed restores to measure it yet'})`; };
+function why(P, s) {
+  const a = P.auto, kr = kRat();
+  switch (a.basis) {
+    case 'server': return `Measured — median of ${plural(P.own.n, 'timed restore')} on ${esc(s)}${P.own.n > 1 ? ` (min ${r0(P.own.min)} · max ${r0(P.own.max)} MB/s)` : ''}.`;
+    case 'backup': return `No restore has been timed on ${esc(s)}, so its own backups are used: ${plural(P.bk.n, 'backup')} ran at ${r0(P.bk.min)}–${r0(P.bk.max)} MB/s (median ${r0(P.bk.med)}). Restores are taken as ${kTxt()}: ${r0(P.bk.med)} × ${kr.k.toFixed(2)} = ${fmtRate(P.bkEst.med)}.`;
+    case 'peer': {
+      const g = P.peer, L = g.servers, nm = L.slice(0, 4).map(esc).join(', ') + (L.length > 4 ? ` +${L.length - 4} more` : '');
+      return g.kind === 'restore'
+        ? `No restore or backup timing for ${esc(s)}. ${plural(L.length, 'similar server')} with ${esc(tierTxt(g, s))} (${nm}) restored at ${r0(g.st.min)}–${r0(g.st.max)} MB/s — median ${fmtRate(g.st.med)} over ${plural(g.st.n, 'timed restore')}.`
+        : `No restore or backup timing for ${esc(s)}. ${plural(L.length, 'similar server')} with ${esc(tierTxt(g, s))} (${nm}) backed up at ${r0(g.raw.min)}–${r0(g.raw.max)} MB/s (median ${r0(g.raw.med)}); at ${kTxt()} that is ${fmtRate(g.st.med)}.`;
+    }
+    case 'estate': return a.est === 'restore' ? `No similar server with evidence — estate median of ${plural(EST.n, 'timed restore')} (middle half ${r0(EST.p25)}–${r0(EST.p75)} MB/s).`
+      : `No similar server with evidence — estate median backup speed ${r0(ESTB.med)} MB/s (middle half ${r0(ESTB.p25)}–${r0(ESTB.p75)}) at ${kTxt()}.`;
+    default: return H ? 'No restore or backup evidence for this server or any similar server — 200 MB/s placeholder.' : 'Restore history not loaded yet — 200 MB/s placeholder.';
+  }
+}
+function sourcesTable(P) {
+  const kr = kRat(), g = P.peer;
+  const R = [
+    ['server', 'Timed restores on this server', P.own ? `${r0(P.own.min)} / <b>${r0(P.own.med)}</b> / ${r0(P.own.max)} MB/s · ${plural(P.own.n, 'restore')}` : ''],
+    ['backup', `This server's backups × ${kr.k.toFixed(2)}`, P.bk ? `${r0(P.bk.min)} / <b>${r0(P.bk.med)}</b> / ${r0(P.bk.max)} MB/s backup → ${fmtRate(P.bkEst.med)} restore · ${plural(P.bk.n, 'backup')}` : ''],
+    ['peer', 'Similar servers', g ? `${fmtRate(g.st.med)} · ${plural(g.servers.length, 'server')} with ${esc(tierTxt(g, P.s))} · ${g.kind === 'restore' ? 'timed restores' : 'backups × ' + kr.k.toFixed(2)}` : ''],
+    ['estate', 'Estate', EST ? `${fmtRate(EST.med)} · ${plural(EST.n, 'timed restore')}` : ESTB ? `${fmtRate(kr.k * ESTB.med)} · backups × ${kr.k.toFixed(2)}` : '']];
+  return `<table class="src"><thead><tr><th>Source, in order of preference</th><th>Value</th><th></th></tr></thead><tbody>${R.map(([k, l, v]) => `<tr class="${P.auto.basis === k ? 'use' : ''}"><td>${l}</td><td>${v || '<span class="none">not available</span>'}</td><td>${P.auto.basis === k ? '<span class="pill ok">used</span>' : ''}</td></tr>`).join('')}</tbody></table>`;
+}
+// clickable throughput values: click to use that number for the server
+const chip = (s, v, lbl) => `<button class="pk${MAN[s] != null && Math.abs(MAN[s] - v) < 0.5 ? ' on' : ''}" data-s="${esc(s)}" data-v="${v}" title="Use ${r0(v)} MB/s for ${esc(s)}">${lbl ? lbl + ' ' : ''}${r0(v)}</button>`;
+const chips3 = (s, o, lbl) => o ? `<div class="pick">${chip(s, o.min, lbl ? 'min' : '')}${chip(s, o.med, lbl ? 'median' : '')}${chip(s, o.max, lbl ? 'max' : '')}</div>` : '';
+function peerTable(g, s) {
+  return `<h3>Similar servers used — ${esc(tierTxt(g, s))}</h3><div class="scroll"><table><thead><tr><th>Server</th><th>Compute</th><th class="num">${g.kind === 'restore' ? 'Timed restores' : 'Backups'} MB/s<div class="small">min / median / max</div></th><th class="num">Samples</th></tr></thead><tbody>${g.servers.map(x => { const o = g.kind === 'restore' ? PROF0[x].own : PROF0[x].bk; return `<tr><td><b>${esc(x)}</b> ${envPill(spec(x).env)} ${catPill(x)}</td><td class="small">${specTxt(x)}</td><td class="num">${r0(o.min)} / <b>${r0(o.med)}</b> / ${r0(o.max)}</td><td class="num">${o.n}</td></tr>`; }).join('')}</tbody></table></div>`;
+}
+
+/* ============================================================ impact tab */
+function viewServer() {
+  const s = $('#srvsel').value, isDR = DRSET.has(s) && !PRODSET.has(s);
+  const L = D.prod.filter(x => isDR ? x.drs.includes(s) : x.srvs.includes(s)).sort((p, q) => q.mb - p.mb);
+  const alsoDR = isDR ? [] : D.prod.filter(x => x.drs.includes(s) && !x.srvs.includes(s));
+  return { kind: 'srv', s, isDR, L, alsoDR, rows: L.map(x => ({ x, P: dbTime(x, 'P', s), R: dbTime(x, 'R', s) })) };
+}
+function viewApp() {
+  const a = $('#app').value, L = D.prod.filter(x => x.apps.includes(a)).sort((p, q) => q.mb - p.mb);
+  return { kind: 'app', a, L, rows: L.map(x => ({ x, P: dbTime(x, 'P', ''), R: dbTime(x, 'R', '') })) };
+}
+// default restore target = the replica with the strongest evidence of its own: timed restores, then most backups
+const ERANK = { server: 0, backup: 1, peer: 2, estate: 3, assumed: 4 };
+const bestNode = L => L.slice().sort((x, y) => { const p = prof(x).auto, q = prof(y).auto; return ERANK[p.basis] - ERANK[q.basis] || (q.n || 0) - (p.n || 0) || x.localeCompare(y); })[0];
+// PROD / DR restore-target pickers for the selected AG (kept while the same AG stays selected)
+function agTargets(a) {
+  const p = $('#agp'), d = $('#agd');
+  if (p.dataset.ag !== a.ag) {
+    p.innerHTML = a.nodes.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+    d.innerHTML = a.dr.length ? a.dr.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('') : '<option value="">none</option>';
+    p.value = bestNode(a.nodes); if (a.dr.length) d.value = bestNode(a.dr);
+    p.dataset.ag = a.ag;
+  }
+  return { pT: p.value || a.nodes[0], dT: d.value || a.dr[0] || '' };
+}
+// the whole Availability Group: every replica, every database; restore = rebuild all AG databases on the chosen target
+function viewAG() {
+  const a = AGS.find(g => g.ag === $('#agsel').value) || AGS[0], { pT, dT } = agTargets(a), L = a.L.slice().sort((p, q) => q.mb - p.mb);
+  return { kind: 'ag', a, s: pT, dT, isDR: false, L, rows: L.map(x => ({ x, P: dbTimeOn(x, pT, 'P'), R: dT ? dbTimeOn(x, dT, 'R') : null })) };
+}
+function agSpecs(V) {
+  const a = V.a, ver = [...new Set(a.nodes.map(n => sqlv(spec(n).ver)).filter(Boolean))].join(' / '), n = a.nodes.length, cov = [];
+  cov.push(n > 1 ? `One PROD replica fails → failover to one of the other ${n - 1} PROD replica${n > 2 ? 's' : ''} — no restore.` : `The PROD replica fails → ${a.dr.length ? 'failover to the DR replica — no restore.' : 'no other replica — restore from backup.'}`);
+  if (a.dr.length) cov.push(`The PROD site fails → failover to DR ${a.dr.map(esc).join(', ')} — no restore; data loss = replication lag.`);
+  cov.push(`Restore from backup only if every replica is lost — the restore times below show that case, restoring on <b>${esc(V.s)}</b>${V.dT ? ` (PROD) or <b>${esc(V.dT)}</b> (DR)` : ''}.`);
+  return `<div class="agsum"><b class="t">AG ${esc(a.ag)}</b><span class="catp ag">Availability Group</span><span class="pill">${a.nodes.length} PROD + ${a.dr.length} DR</span>${[...new Set(a.nodes.concat(a.dr).map(pfPill))].join('')}<span class="small">covers ${a.app.map(esc).join(', ')} · ${plural(a.n, 'database')} · ${fmtMB(a.mb)} on every replica${ver ? ' · ' + esc(ver) : ''}</span></div>`
+    + `<div class="specs">${a.nodes.map(x => sbox(x, x === V.s ? 'PROD · restore target' : 'PROD replica', 'p')).join('')}<div class="sarrow">➜</div>${a.dr.length ? a.dr.map(x => sbox(x, x === V.dT ? 'DR · restore target' : 'DR replica', 'd')).join('') : '<div class="sbox n"><span class="role">DR</span><b class="nm">No DR replica in inventory</b></div>'}</div>`
+    + `<ul class="agcov">${cov.map(c => `<li>${c}</li>`).join('')}</ul>`;
+}
+function agHtml(V) {
+  const a = V.a, tP = plan(V.rows.map(r => r.P)), tD = plan(V.rows.map(r => r.R));
+  const tl = (t, lbl) => t.n ? `<b>${fmtMin(t.typ.total)}</b>${fmtRng(t.best.total, t.worst.total) ? ` <span class="muted">(${fmtRng(t.best.total, t.worst.total)})</span>` : ''} ${infoX('imp', () => explainPlan(t, `AG ${a.ag} — ${lbl}`))}` : '<b>—</b>';
+  return `<h2>AG ${esc(a.ag)} — the databases it covers</h2><div class="gh ag"><div class="gh-t"><b>AG ${esc(a.ag)}</b><span class="catp ag">Availability Group</span><span class="small">${plural(V.L.length, 'DB')} · ${fmtMB(sum(V.L, x => x.mb))}</span><span class="pill ok">${a.nodes.length > 1 ? 'Replica failure = failover, no restore' : a.dr.length ? 'Failover to DR, no restore' : 'Single replica — restore from backup'}</span></div>
+     <div class="small">PROD replicas: ${a.nodes.map(x => esc(x) + (x === V.s ? ' <b>(restore target)</b>' : '')).join(', ')} · DR: ${a.dr.length ? a.dr.map(x => esc(x) + (x === V.dT ? ' <b>(restore target)</b>' : '')).join(', ') : 'none'}</div>
+     <div class="small gtot">If every replica were lost — restore all on PROD ${tl(tP, 'restore all on ' + V.s)} &nbsp;·&nbsp; on DR ${tl(tD, 'restore all on ' + (V.dT || 'DR'))}</div></div>` + dbTableHtml(V.rows);
+}
+function dbTableHtml(L) {
+  return `<div class="scroll"><table><thead><tr class="grp"><th colspan="2"></th><th class="p" colspan="3">PRODUCTION</th><th class="d" colspan="4">DR</th></tr><tr><th>Database</th><th>Application</th><th class="p num">Size</th><th class="p">Latest restore</th><th class="p num">Restore time</th><th class="d">DR server</th><th class="d num">DR size</th><th class="d">Latest restore</th><th class="d num">Restore time</th></tr></thead>
+     <tbody>${L.map(r => `<tr><td><b>${esc(r.x.db)}</b>${copyPill(r.x)}${bigLog(r.P)}</td><td class="small">${r.x.apps.map(esc).join(', ')}</td><td class="num">${fmtMB(r.x.mb)}</td><td>${lastRestore(r.P ? r.P.s : '', r.x.db)}</td><td class="num">${rt(r.P)}</td><td>${r.R ? esc(r.R.s) + (r.x.drs.length > 1 ? ` <span class="small" title="${esc(r.x.drs.join(', '))}">+${r.x.drs.length - 1}</span>` : '') : r.x.dr ? esc(r.x.dr) : '<span class="none">—</span>'}</td><td class="num">${r.x.dr ? fmtMB(r.x.drmb) : '—'}${sizeFlag(r.x)}</td><td>${r.x.dr ? lastRestore(r.R ? r.R.s : r.x.dr, r.x.db) : '—'}</td><td class="num">${rt(r.R)}</td></tr>`).join('')}</tbody></table></div>`;
+}
+const kpi = (label, val, sub = '', cls = '', info = '') => `<div class="kpi ${cls}"><span class="l">${label}${info}</span><b class="v">${val}</b>${sub ? `<span class="s">${sub}</span>` : ''}</div>`;
+function kpiTotal(label, pl, cls, ctx) {
+  if (!pl.n) return kpi(label, '—', cls === 'dr' ? 'No DR copies in the inventory for this selection' : 'Nothing to restore', cls);
+  const rg = fmtRng(pl.best.total, pl.worst.total);
+  return kpi(label, fmtMin(pl.typ.total), (rg ? `best–worst ${rg}` : '') + `<span class="s">${mixTxt(pl.mix)}</span>`, cls, infoX('imp', () => explainPlan(pl, label + (ctx ? ' — ' + ctx : ''))));
+}
+function lastRestore(s, db) {
+  if (!H) return '<span class="none">—</span>';
+  const o = s ? H.db[s + '|' + db.toLowerCase()] : null;
+  if (!o) return '<span class="none" title="Server not in the restore-history file">not collected</span>';
+  if (!o.LastRestoreDate || /no restore/i.test(o.LastRestoreDate)) return '<span class="none">No restore history</span>';
+  return `<span class="real">${esc(o.LastRestoreDate.slice(0, 16))}</span>${o.RestoredFromServer ? `<div class="small">from ${esc(o.RestoredFromServer)}</div>` : ''}`;
+}
+function rt(o) {
+  if (!o) return '<span class="none">—</span>';
+  const i = ROWS.push(o) - 1, rg = fmtRng(o.best, o.worst), k = KIND(o.basis);
+  return `<button class="rt b-${k}" data-i="${i}" title="Rationale"><b>${fmtMin(o.t)}</b><i>${KN[k]}</i>${rg ? `<small>${rg}</small>` : ''}</button>`;
+}
+const sizeFlag = x => x.dr && x.drmb && x.mb && Math.abs(x.drmb / x.mb - 1) > 0.2 ? ' <span class="pill off" title="DR copy size differs from PROD by more than 20%">≠PROD</span>' : '';
+const bigLog = o => o && o.v.log && o.v.log >= 10240 && o.v.log > 0.5 * o.v.V ? ` <span class="pill warn" title="Allocated log ${fmtMB(o.v.log)}: the whole log is zero-initialized during a restore, expect extra time">large log</span>` : '';
+const copyPill = x => x.copy ? ' <span class="pill oth" title="Name looks like a restore copy or archive">copy?</span>' : '';
+function recPath(L, s, isDR, isAG) {
+  if (isDR) return { cls: 'warn', txt: 'PROD unaffected — DR copy lost until this server is rebuilt' };
+  if (isAG) {
+    const others = [...new Set(L.flatMap(r => r.x.srvs))].filter(n => n !== s), drs = [...new Set(L.flatMap(r => r.x.drs))];
+    if (others.length) return { cls: 'ok', txt: `AG failover to ${others.join(', ')} — no restore needed` };
+    if (drs.length) return { cls: 'ok', txt: `AG failover to DR replica ${drs.join(', ')} — no restore; data loss = replica lag` };
+    return { cls: 'off', txt: 'Single-replica AG — restore from backup' };
+  }
+  const w = L.filter(r => r.x.dr);
+  if (w.length === L.length) { const d = [...new Set(w.map(r => r.x.dr))].join(', '); return { cls: 'ok', txt: w.some(r => /failover group/i.test(r.x.mech)) ? `Failover group to ${d}` : `Recover on DR ${d} — ${w[0].x.mech}` }; }
+  if (w.length) return { cls: 'warn', txt: `${w.length} of ${L.length} DBs have a DR copy — the rest need a restore from backup` };
+  return { cls: 'off', txt: 'No DR copy in inventory — restore from backup' };
+}
+function recCell(x) {
+  if (x.ag !== 'NA' && x.srvs.length > 1) return '<span class="pill ok">AG failover (PROD replica)</span>';
+  if (x.dr && /^Always On/i.test(x.mech)) return '<span class="pill ok">AG failover to DR</span>';
+  if (x.dr && /failover group/i.test(x.mech)) return '<span class="pill ok">MI failover group</span>';
+  if (x.dr) return `<span class="small">${esc(x.mech)}</span>`;
+  return '<span class="pill off">Restore from backup</span>';
+}
+function sbox(n, role, cls) {
+  const p = spec(n), P = prof(n);
+  return `<div class="sbox ${cls}${cls === 'p' ? ' ' + catOf(n) : ''}"><span class="role">${role}</span><b class="nm">${esc(n)}</b><div class="pills">${pfPill(n)}${cls === 'p' ? catPill(n) : ''}${p.ifi ? `<span class="pf" title="Instant file initialization"><i></i>IFI ${esc(p.ifi)}</span>` : ''}</div><div style="margin-top:4px"><b>${p.cpu || '—'} vCPU</b> · <b>${p.mem ? p.mem + ' GB' : '—'}</b>${p.vm ? ' · ' + esc(p.vm) : ''}</div>${p.loc || p.ver ? `<div class="small">${esc([p.loc, sqlv(p.ver)].filter(Boolean).join(' · '))}</div>` : ''}<div class="tp">Restore ${badge(P.basis)} <b>${fmtRate(P.plan)}</b></div></div>`;
+}
+function smaller(d, pList) {
+  const pc = Math.max(0, ...pList.map(n => spec(n).cpu || 0)), pm = Math.max(0, ...pList.map(n => spec(n).mem || 0)), x = spec(d), o = [];
+  if (x.cpu && pc && x.cpu < pc) o.push(`vCPU ${x.cpu} vs ${pc}`); if (x.mem && pm && x.mem < pm) o.push(`memory ${x.mem} vs ${pm} GB`); return o;
+}
+function renderImpact(full = true) {
+  const m = $('#mode').value;
+  $('#app').hidden = m !== 'app'; $('#srvsel').hidden = m !== 'srv'; $('#agsel').hidden = m !== 'ag'; $('#agtgt').hidden = m !== 'ag';
+  $('#impact').hidden = m === 'app'; $('#appcard').hidden = m !== 'app';
+  XP.imp = []; ROWS = [];
+  if (m === 'srv' && !$('#srvsel').value || m === 'app' && !$('#app').value || m === 'ag' && !AGS.length) { $('#k').innerHTML = `<p class="none">${m === 'ag' ? 'No Availability Groups in the inventory.' : 'No PROD databases in the inventory.'}</p>`; return; }
+  const V = VIEW = m === 'srv' ? viewServer() : m === 'ag' ? viewAG() : viewApp();
+  const tp = plan(V.rows.map(r => r.P)), td = plan(V.rows.map(r => r.R));
+  const tot = V.L.reduce((a, x) => a + x.mb, 0), bkr = V.rows.filter(r => r.P && r.P.v.bk), bkv = bkr.reduce((a, r) => a + r.P.v.bk.mb, 0);
+  const sizeSub = bkr.length ? `allocated · backup data ${fmtMB(bkv)}${bkr.length < V.L.length ? ` (${bkr.length} of ${V.L.length} DBs)` : ''}` : 'allocated (data + log files)';
+  const ctx = m === 'srv' ? V.s : m === 'ag' ? 'AG ' + V.a.ag : V.a;
+  $('#k').innerHTML = (m === 'srv' ? kpi(V.isDR ? 'PROD databases protected' : 'Databases impacted', V.L.length.toLocaleString('en-US'), V.isDR ? 'PROD databases with a copy on this DR server' : 'online user databases on this server', 'hl')
+    : m === 'ag' ? kpi('Databases in this AG', V.L.length.toLocaleString('en-US'), `${V.a.nodes.length} PROD + ${V.a.dr.length} DR replicas · ${V.a.app.length > 2 ? plural(V.a.app.length, 'application') : esc(V.a.app.join(', '))}`, 'hl')
+    : kpi('PROD databases', V.L.length.toLocaleString('en-US'), 'online user databases of this application', 'hl'))
+    + kpi('Total size', fmtMB(tot), sizeSub) + kpiTotal(m === 'ag' ? `Restore all — PROD · ${esc(V.s)}` : 'Restore all — PROD', tp, 'pr', ctx) + kpiTotal(m === 'ag' && V.dT ? `Restore all — DR · ${esc(V.dT)}` : 'Restore all — DR', td, 'dr', ctx);
+  if (m === 'srv') {
+    const pList = V.isDR ? [...new Set(V.L.flatMap(x => x.srvs))].sort() : [V.s], dL = V.isDR ? [V.s] : [...new Set(V.L.flatMap(x => x.drs))].sort();
+    const isAGNode = !V.isDR && AGS.some(a => a.nodes.includes(V.s)), myAGs = AGS.filter(a => a.nodes.includes(V.s) || a.dr.includes(V.s));
+    $('#srvt').innerHTML = `<div class="specs">${pList.map(n => sbox(n, V.isDR ? 'PROD (protected)' : isAGNode ? 'PROD · AG replica' : 'PROD · Standalone', 'p')).join('')}<div class="sarrow">➜</div>${dL.length ? dL.map(d => sbox(d, 'DR', 'd') + (!V.isDR && smaller(d, pList).length ? `<div class="pill warn" style="align-self:center">DR smaller: ${smaller(d, pList).join(', ')}</div>` : '')).join('') : '<div class="sbox n"><span class="role">DR</span><b class="nm">No DR copy in inventory</b><div class="small">Recovery = restore from backup</div></div>'}</div>`
+      + (myAGs.length ? `<div style="margin-top:8px">${myAGs.map(a => `<button class="lnk" data-agview="${esc(a.ag)}">See the whole AG ${esc(a.ag)} — all ${a.nodes.length + a.dr.length} replicas, its databases and throughput →</button>`).join(' ')}</div>` : '');
+  } else if (m === 'ag') $('#srvt').innerHTML = agSpecs(V);
+  else $('#srvt').innerHTML = appServers(V);
+  const side = S.side === 'R' && td.n ? 'R' : 'P';
+  $$('#sidesel button').forEach(b => { b.classList.toggle('on', b.dataset.side === side); b.disabled = b.dataset.side === 'R' && !td.n; });
+  const pl = side === 'P' ? tp : td;
+  drawTimeline(pl);
+  $('#tlcap').textContent = pl.n ? `${side === 'P' ? 'PROD' : 'DR'} · ${plural(pl.n, 'database')} · ${fmtMB(pl.vol)}${pl.excluded ? ` · ${pl.excluded} copies excluded` : ''}` : '';
+  $('#apprec').innerHTML = appRec(pl, side);
+  if (full) thrPanel(V); else updThr(V);
+  if (m === 'srv') $('#impact').innerHTML = groupsHtml(V);
+  else if (m === 'ag') $('#impact').innerHTML = agHtml(V);
+  else { $('#t1').textContent = `${V.a} — PROD vs DR (${plural(V.L.length, 'database')})`; $('#tb').innerHTML = appTable(V); }
+  offl(m === 'srv' ? D.off.filter(o => o.srv === V.s) : m === 'ag' ? D.off.filter(o => V.a.nodes.includes(o.srv) || V.a.dr.includes(o.srv)) : D.off.filter(o => (o.apps || [o.app]).includes(V.a)),
+    m === 'srv' ? 'None on this server.' : m === 'ag' ? 'None on the AG replicas.' : 'None for this application in PROD / DR.');
+}
+function groupsHtml(V) {
+  const s = V.s, G = new Map();
+  V.rows.forEach(r => { const k = r.x.ag !== 'NA' ? 'AG ' + r.x.ag : V.isDR ? 'Standalone ' + r.x.srv : 'Standalone'; if (!G.has(k)) G.set(k, []); G.get(k).push(r); });
+  let h = `<h2>${V.isDR ? `If ${esc(s)} goes offline — PROD databases that lose their DR copy` : `If ${esc(s)} goes offline — impacted databases`}</h2>`;
+  if (!G.size) return h + '<p class="none">No online PROD databases.</p>';
+  G.forEach((L, gk) => {
+    const isAG = gk.startsWith('AG '), nodes = isAG ? [...new Set(L.flatMap(r => r.x.srvs))].sort() : [...new Set(L.map(r => r.x.srv))];
+    const drs = [...new Set(L.flatMap(r => r.x.drs))].sort(), rp = recPath(L, s, V.isDR, isAG);
+    const tP = plan(L.map(r => r.P)), tD = plan(L.map(r => r.R));
+    const pfs = [...new Set(nodes.map(pfPill))].join(' ');
+    const tl = (t, lbl) => t.n ? `<b>${fmtMin(t.typ.total)}</b>${fmtRng(t.best.total, t.worst.total) ? ` <span class="muted">(${fmtRng(t.best.total, t.worst.total)})</span>` : ''} ${infoX('imp', () => explainPlan(t, `${gk} — ${lbl}`))}` : '<b>—</b>';
+    const gc = isAG ? 'ag' : V.isDR ? 'dr' : catOf(s);
+    h += `<div class="gh ${gc}"><div class="gh-t"><b>${esc(gk)}</b><span class="catp ${gc}">${CATN[gc]}</span>${pfs}<span class="small">${plural(L.length, 'DB')} · ${fmtMB(L.reduce((a, r) => a + r.x.mb, 0))}</span><span class="pill ${rp.cls}" title="Recovery path">${esc(rp.txt)}</span></div>
+     <div class="small">${isAG ? 'Replicas' : 'Instance'}: ${nodes.map(n => esc(n) + (n === s ? ' <b>(offline)</b>' : '')).join(', ')} · DR: ${drs.length ? drs.map(d => `${esc(d)} <span class="muted">(${specTxt(d)})</span>`).join(', ') : 'no DR copy in inventory'}</div>
+     <div class="small gtot">Restore all — PROD ${tl(tP, 'restore all on PROD')} &nbsp;·&nbsp; DR ${tl(tD, 'restore all on DR')}</div></div>` + dbTableHtml(L);
+  });
+  if (V.alsoDR && V.alsoDR.length) h += `<div class="gh"><div class="gh-t"><b>Also on ${esc(s)}: DR copies of other PROD databases</b><span class="small">${plural(V.alsoDR.length, 'DB')}</span><span class="pill warn">PROD unaffected — these lose their DR copy until ${esc(s)} is rebuilt</span></div><div class="small">${V.alsoDR.map(x => `${esc(x.db)} <span class="muted">(PROD ${esc(x.srvs.join(', '))})</span>`).join(' · ')}</div></div>`;
+  return h;
+}
+function appServers(V) {
+  const U = new Map();
+  V.L.forEach(x => { const u = U.get(x.unit) || { ag: x.ag, srvs: new Set(), dr: new Set(), n: 0, mb: 0 }; x.srvs.forEach(s => u.srvs.add(s)); x.drs.forEach(s => u.dr.add(s)); u.n++; u.mb += x.mb; U.set(x.unit, u); });
+  const US = [...U.values()].sort((p, q) => (q.dr.size > 0) - (p.dr.size > 0) || q.mb - p.mb);
+  const cells = s => { const p = spec(s); return `<td>${esc(s)}</td><td>${pfPill(s)}</td><td class="num">${p.cpu || '—'}</td><td class="num">${p.mem ? p.mem + ' GB' : '—'}</td><td>${esc(p.vm || '—')}</td>`; };
+  let h = `<div class="scroll" style="margin-top:14px"><table><thead><tr class="grp"><th></th><th class="p" colspan="5">PRODUCTION</th><th class="d" colspan="5">DR</th></tr><tr><th>AG / Instance</th><th class="p">Server</th><th class="p">Platform</th><th class="p num">vCPU</th><th class="p num">Memory</th><th class="p">VM size</th><th class="d">Server</th><th class="d">Platform</th><th class="d num">vCPU</th><th class="d num">Memory</th><th class="d">VM size</th></tr></thead><tbody>`;
+  US.forEach(u => {
+    const ps = [...u.srvs].sort(), ds = [...u.dr].sort(), n = Math.max(ps.length, ds.length, 1);
+    for (let i = 0; i < n; i++) {
+      h += `<tr>${i ? '' : `<td rowspan="${n}"><b>${u.ag !== 'NA' ? 'AG ' + esc(u.ag) : 'Standalone'}</b><div class="small">${plural(u.n, 'DB')} · ${fmtMB(u.mb)}</div></td>`}${ps[i] ? cells(ps[i]) : '<td colspan="5"></td>'}${ds[i] ? cells(ds[i]) : i ? '<td colspan="5"></td>' : '<td colspan="5"><span class="muted">No DR copy in inventory</span></td>'}</tr>`;
+    }
+  });
+  return h + '</tbody></table></div>';
+}
+function appTable(V) {
+  return `<thead><tr class="grp"><th></th><th class="p" colspan="4">PRODUCTION</th><th class="d" colspan="4">DR</th><th></th></tr><tr><th>Database</th><th class="p">PROD server</th><th class="p num">Size</th><th class="p">Latest restore</th><th class="p num">Restore time</th><th class="d">DR server</th><th class="d num">DR size</th><th class="d">Latest restore</th><th class="d num">Restore time</th><th>Recovery path</th></tr></thead><tbody>` +
+    V.rows.map(r => `<tr><td><b>${esc(r.x.db)}</b>${copyPill(r.x)}${bigLog(r.P)}</td><td>${r.x.srvs.map(esc).join('<br>')}<div>${pfPill(r.x.srvs[0])}</div></td><td class="num">${fmtMB(r.x.mb)}</td><td>${lastRestore(r.P ? r.P.s : '', r.x.db)}</td><td class="num">${rt(r.P)}</td><td>${r.x.dr ? esc(r.x.drs.join(', ')) : '<span class="none">—</span>'}</td><td class="num">${r.x.dr ? fmtMB(r.x.drmb) : '—'}${sizeFlag(r.x)}</td><td>${r.x.dr ? lastRestore(r.x.dr, r.x.db) : '—'}</td><td class="num">${rt(r.R)}</td><td>${recCell(r.x)}</td></tr>`).join('') + '</tbody>';
+}
+function offl(O, msg) {
+  $('#off').innerHTML = O.length ? `<div class="scroll"><table><thead><tr><th>Server</th><th>Env</th><th>Database</th><th>State</th><th class="num">Size</th></tr></thead><tbody>${O.map(o => `<tr><td>${esc(o.srv)}</td><td>${envPill(o.env)}</td><td>${esc(o.db)}</td><td><span class="pill off">${esc(o.st)}</span></td><td class="num">${fmtMB(o.mb)}</td></tr>`).join('')}</tbody></table></div>` : `<span class="none">${msg}</span>`;
+}
+/* ---- timeline */
+function niceStep(T) { const c = [1, 2, 5, 10, 15, 20, 30, 60, 120, 180, 240, 360, 480, 720, 1440, 2880, 4320, 10080, 20160]; return c.find(s => T / s <= 7) || Math.ceil(T / 7); }
+function tickLbl(t) { if (t <= 0) return '0'; if (t < 60) return Math.round(t) + 'm'; if (t >= 2880) return (t / 1440).toFixed(t % 1440 ? 1 : 0) + 'd'; const h = Math.floor(t / 60), mm = Math.round(t % 60); return mm ? `${h}h${String(mm).padStart(2, '0')}` : h + 'h'; }
+function appColors(pl) {
+  const vl = new Map(); pl.typ.seq.forEach(q => vl.set(q.it.x.app, (vl.get(q.it.x.app) || 0) + q.it.v.V));
+  const ranked = [...vl.entries()].sort((a, b) => b[1] - a[1]).map(e => e[0]), m = new Map();
+  ranked.forEach((a, i) => m.set(a, i < PAL.length ? PAL[i] : OTHER)); m.ranked = ranked; return m;
+}
+function drawTimeline(pl) {
+  const el = $('#tl'); TLP = pl;
+  if (!pl || !pl.n) { el.innerHTML = `<p class="none" style="margin:10px 0">Nothing to restore on this side for the current selection.</p>`; $('#tlg').innerHTML = ''; return; }
+  const W = Math.max(560, Math.floor(el.clientWidth || 960)), k = Math.max(1, Math.min(pl.k, pl.n)), laneH = k > 8 ? 14 : k > 4 ? 18 : 22, gap = 6, padL = 84, padR = 18, padT = 28, axH = 24;
+  const Hh = padT + k * laneH + (k - 1) * gap + axH + 6, T = Math.max(pl.typ.total, 1e-6), pw = W - padL - padR, X = m => padL + (m / T) * pw;
+  const step = niceStep(T), col = appColors(pl);
+  let g = '';
+  for (let t = 0; t <= T + 1e-9; t += step) { const x = X(t).toFixed(1); g += `<line class="gl" x1="${x}" x2="${x}" y1="${padT - 6}" y2="${Hh - axH}"/><text class="tk" x="${x}" y="${Hh - 8}" text-anchor="${t === 0 ? 'start' : 'middle'}">${tickLbl(t)}</text>`; }
+  g += `<line class="ax" x1="${padL}" x2="${W - padR}" y1="${Hh - axH}" y2="${Hh - axH}"/>`;
+  for (let i = 0; i < k; i++) { const y = padT + i * (laneH + gap); g += `<text class="ll" x="${padL - 10}" y="${y + laneH / 2 + 4}" text-anchor="end">${k === 1 ? 'Sequential' : 'Stream ' + (i + 1)}</text>`; }
+  pl.typ.seq.forEach((q, i) => {
+    const y = padT + q.lane * (laneH + gap), x0 = X(q.start), w = X(q.end) - x0, ov = Math.min(w, (S.ovh / T) * pw), c = col.get(q.it.x.app) || OTHER, gp = w > 6 ? 1 : 0;
+    g += `<g class="tb" data-q="${i}"><rect class="hit" x="${x0.toFixed(1)}" y="${y - 2}" width="${Math.max(3, w).toFixed(1)}" height="${laneH + 4}"/>`;
+    if (ov > 0.6) g += `<rect x="${(x0 + gp).toFixed(1)}" y="${y}" width="${Math.max(0.5, ov - gp).toFixed(1)}" height="${laneH}" fill="${c}" opacity=".3"/>`;
+    const dw = w - ov - 2 * gp; if (dw > 0.3) g += `<rect x="${(x0 + ov).toFixed(1)}" y="${y}" width="${dw.toFixed(1)}" height="${laneH}" rx="${dw > 8 ? 3 : 0}" fill="${c}"/>`;
+    g += '</g>';
+  });
+  const ends = pl.typ.seq.map(q => q.end).sort((a, b) => a - b), half = ends[Math.ceil(ends.length / 2) - 1];
+  const mk = (t, lbl, anchor) => { const x = X(t); return `<line class="mk" x1="${x.toFixed(1)}" x2="${x.toFixed(1)}" y1="${padT - 10}" y2="${Hh - axH}"/><text class="mkl" x="${(x + (anchor === 'end' ? -4 : 4)).toFixed(1)}" y="${padT - 14}" text-anchor="${anchor}">${lbl}</text>`; };
+  g += mk(T, `All restored · ${fmtMin(T)}`, 'end');
+  if (pl.n > 1 && half < T) g += X(T) - X(half) > 190 ? mk(half, `50% of DBs online · ${fmtMin(half)}`, 'start') : `<line class="mk" x1="${X(half).toFixed(1)}" x2="${X(half).toFixed(1)}" y1="${padT - 4}" y2="${Hh - axH}"/>`;
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${Hh}" width="${W}" height="${Hh}" role="img" aria-label="Restore timeline: ${pl.n} databases, all restored after ${fmtMin(T)}">${g}</svg>`;
+  const named = col.ranked.filter(a => col.get(a) !== OTHER), rest = col.ranked.length - named.length;
+  $('#tlg').innerHTML = named.map(a => `<span class="lgi"><i class="sw" style="background:${col.get(a)}"></i>${esc(a)}</span>`).join('') + (rest ? `<span class="lgi"><i class="sw" style="background:${OTHER}"></i>Other (${plural(rest, 'application')})</span>` : '') + `<span class="small">· light segment = overhead · best ${fmtMin(pl.best.total)} · worst ${fmtMin(pl.worst.total)}</span>`;
+}
+function appRec(pl, side) {
+  if (!pl.n) return '';
+  const A = new Map();
+  const add = (run, key) => run.seq.forEach(q => { const a = q.it.x.app, r = A.get(a) || { app: a, n: 0, vol: 0, typ: 0, best: 0, worst: 0 }; if (key === 'typ') { r.n++; r.vol += q.it.v.V; } r[key] = Math.max(r[key], q.end); A.set(a, r); });
+  add(pl.typ, 'typ'); add(pl.best, 'best'); add(pl.worst, 'worst');
+  const col = appColors(pl), L = [...A.values()].sort((a, b) => a.typ - b.typ);
+  return `<h3>Back online by application — ${side === 'P' ? 'PROD' : 'DR'}</h3><div class="scroll"><table><thead><tr><th>Application</th><th class="num">DBs</th><th class="num">Volume</th><th class="num">Typical</th><th class="num">Best – worst</th></tr></thead><tbody>${L.map(r => `<tr><td><span class="lgi"><i class="sw" style="background:${col.get(r.app) || OTHER}"></i>${esc(r.app)}</span></td><td class="num">${r.n}</td><td class="num">${fmtMB(r.vol)}</td><td class="num"><b>${fmtMin(r.typ)}</b></td><td class="num small">${fmtRng(r.best, r.worst) || '—'}</td></tr>`).join('')}</tbody></table></div>`;
+}
+const toPos = r => Math.round(1000 * Math.log(Math.max(10, Math.min(5000, r)) / 10) / Math.log(500));
+const fromPos = p => { const v = 10 * Math.pow(500, p / 1000); return v < 100 ? Math.round(v) : v < 1000 ? Math.round(v / 5) * 5 : Math.round(v / 10) * 10; };
+// databases of the current view restored on server s, one after another, at the throughput in use
+// AG view: every AG database restored on that replica; other views: the databases of the view that restore on it
+function thrTime(s, V) {
+  const L = (V.kind === 'ag' ? V.L.map(x => dbTimeOn(x, s, V.a.nodes.includes(s) ? 'P' : 'R')) : V.rows.flatMap(r => [r.P, r.R]).filter(o => o && o.s === s)).filter(o => o && !(S.excl && o.x.copy));
+  return L.length ? `<b>${fmtMin(sum(L, o => S.ovh + o.t))}</b><div class="small">${plural(L.length, 'DB')} · one after another</div>` : '<span class="none">—</span>';
+}
+// restore ÷ backup speed: measured on the estate (read-only) or assumed (adjustable); used by every estimate taken from backups
+function kCtl() {
+  $('#kctl').hidden = !H;
+  if (!H) return;
+  const kr = kRat(), p = Math.round(kr.k * 100);
+  $('#i_k').value = Math.max(40, Math.min(100, p)); $('#o_k').textContent = p + '%'; $('#i_k').disabled = !!CAL;
+  $('#kwhy').textContent = CAL ? `Measured on this estate — median of ${plural(CAL.pairs.length, CAL.method === 'server' ? 'server' : 'restore')} with both timed restores and backups.`
+    : 'Assumed — no timed restores to measure it yet. Used for every estimate taken from backups. Restores write the data and zero-initialize the log, so they usually run below backup speed.';
+}
+function thrPanel(V) {
+  XP.thr = [];
+  const isAG = V.kind === 'ag';
+  const ps = isAG ? V.a.nodes : [...new Set(V.rows.map(r => r.P && r.P.s).filter(Boolean))].sort(), ds = isAG ? V.a.dr : [...new Set(V.rows.map(r => r.R && r.R.s).filter(Boolean))].sort();
+  $('#thrk').textContent = H ? '' : 'Load restore history to replace the 200 MB/s placeholder';
+  kCtl();
+  const row = (s, role) => {
+    const P = prof(s), a = P.auto, m = MAN[s] != null;
+    const own = P.own ? chips3(s, P.own, true) + `<div class="small">${plural(P.own.n, 'timed restore')}</div>` : '<span class="none">none timed</span>';
+    const bk = P.bk ? chips3(s, P.bk, true) + `<div class="small">${plural(P.bk.n, 'backup')} · ${plural(P.bk.dbs, 'database')}</div>` : '<span class="none">none collected</span>';
+    const rec = `<b>${fmtRate(a.plan)}</b> ${badge(a.basis)}${a.lo !== a.hi ? `<div class="pick">${chip(s, a.lo, 'low')}${chip(s, a.plan, 'planning')}${chip(s, a.hi, 'high')}</div>` : ''}<div class="whyl">${why(P, s)}</div>${P.warn ? `<div class="small" style="color:#8a5a00">⚠ ${esc(P.warn)}</div>` : ''}`;
+    const tgt = isAG && (s === V.s || s === V.dT);
+    const nm = `<b>${esc(s)}</b>${tgt ? ' <span class="tgtp">restore target</span>' : ''}<div class="pills">${envPill(role)}${catPill(s)}</div>${isAG && !tgt ? `<button class="lnk" data-tgt="${esc(s)}" data-role="${role}" title="Use ${esc(s)} as the ${role} restore target">restore here</button>` : ''}`;
+    return `<tr class="${catOf(s)}${m ? ' is-man' : ''}${tgt ? ' tgt' : ''}" data-s="${esc(s)}"><td>${nm}</td><td>${pfPill(s)}<div class="small" style="margin-top:3px">${specTxt(s)}</div></td><td>${own}</td><td>${bk}</td><td>${rec}</td>`
+      + `<td><div class="sl"><input type="range" min="0" max="1000" step="1" value="${toPos(P.plan)}" data-sl="${esc(s)}" aria-label="Throughput used for ${esc(s)}"><output>${fmtRate(P.plan)}</output></div><button class="lnk" data-rs="${esc(s)}"${m ? '' : ' hidden'}>back to recommended</button></td>`
+      + `<td class="num tmc">${thrTime(s, V)}</td><td>${infoX('thr', () => explainSrv(s), 'How the throughput for ' + s + ' was derived')}</td></tr>`;
+  };
+  const R = [...ps.map(s => row(s, 'PROD')), ...ds.map(s => row(s, 'DR'))];
+  $('#thr').innerHTML = R.length ? `<table class="thr"><thead><tr><th>Server</th><th>Platform · compute</th><th>Timed restores<div class="small">actual · MB/s</div></th><th>Backups<div class="small">actual · MB/s</div></th><th>Recommended restore throughput</th><th>Used (MB/s)</th><th class="num">${isAG ? 'Restore all AG DBs here' : 'Restore here<div class="small">this view</div>'}</th><th></th></tr></thead><tbody>${R.join('')}</tbody></table>` : '<p class="none">No servers in this view.</p>';
+}
+function updThr(V) { $$('#thr tr[data-s]').forEach(tr => { const c = tr.querySelector('.tmc'); if (c) c.innerHTML = thrTime(tr.dataset.s, V); }); }
+/* ---- rationale popups */
+function warnings(o, sp) {
+  let h = '';
+  if (o.P && o.P.warn && KIND(o.basis) === 'est') h += `<p class="fx warnbox">⚠ ${esc(o.P.warn)}</p>`;
+  if (o.v && o.v.log && o.v.log >= 10240 && o.v.log > 0.5 * o.v.V) h += `<p class="fx warnbox">⚠ Allocated log is ${fmtMB(o.v.log)}. The whole log is zero-initialized during a restore, so expect longer than the data volume suggests.</p>`;
+  if (sp.pc === 'PaaS') h += `<p class="fx warnbox">Azure SQL Managed Instance: restores are platform-managed; the DR path is the failover group. Override with a value from an MI test restore if you need this scenario.</p>`;
+  return h;
+}
+function explainDb(o) {
+  if (!o) return;
+  const sp = spec(o.s), rg = fmtRng(o.best, o.worst);
+  const reason = o.basis === 'actual' ? `Measured — this database was restored ${plural(o.own.length, 'time')} on ${esc(o.s)}${o.own.length > 1 ? `, median ${fmtRate(o.st.med)}` : ''}.`
+    : o.basis === 'manual' ? `Set by you (recommended ${fmtRate(o.P.auto.plan)} — ${KN[KIND(o.P.auto.basis)].toLowerCase()}).` : why(o.P, o.s);
+  const volTxt = o.v.src === 'backup' ? 'latest full backup, uncompressed' : 'allocated data + log files';
+  let h = `<div class="why">Picked <b>${fmtRate(o.rate)}</b> on <b>${esc(o.s)}</b>. ${reason}<br>${fmtMB(o.v.V)} (${volTxt}) ÷ ${fmtRate(o.rate)} = <b>${fmtMin(o.t)}</b>${rg ? `, range ${rg}` : ''}.</div>`;
+  h += '<table class="kv">' + KV('Restore target', `${esc(o.s)} · ${o.side === 'P' ? 'PROD' : 'DR'} ${pfPill(o.s)}<div class="small">${specTxt(o.s)}</div>`)
+    + KV('Restore volume', `${fmtMB(o.v.V)} <span class="small">(${volTxt}; allocated ${fmtMB(o.x.mb)})</span>`)
+    + KV('Throughput', `${badge(o.basis)} ${fmtRate(o.rate)}${o.loR !== o.hiR ? ` <span class="small">range ${r0(o.loR)}–${r0(o.hiR)} MB/s</span>` : ''}`)
+    + KV('Restore time', `<b>${fmtMin(o.t)}</b>${rg ? ` <span class="small">best–worst ${rg}</span>` : ''}`)
+    + KV('Confidence', confPill(o.conf)) + '</table>';
+  h += warnings(o, sp);
+  if (o.basis === 'actual') h += `<details style="margin-top:10px"><summary class="small">Timed restores of ${esc(o.x.db)}</summary>${sampleTable(o.own)}</details>`;
+  h += `<p class="small" style="margin-top:10px">RESTORE duration only. Overhead per database is added in the restore-all totals; log replay and application checks are not included.</p>`;
+  openModal({ title: `${o.x.db} — ${fmtMin(o.t)}`, sub: `${o.side === 'P' ? 'PROD' : 'DR'} · ${o.s}`, html: h, cls: KIND(o.basis) });
+}
+function explainPlan(pl, label) {
+  const rg = fmtRng(pl.best.total, pl.worst.total);
+  let h = `<div class="why">${plural(pl.n, 'database')} (${fmtMB(pl.vol)}) restored ${pl.k > 1 ? `on ${pl.k} parallel streams` : 'one after another'}, ${S.order === 'lpt' ? 'largest first' : 'smallest first'}, plus ${S.ovh} min overhead per database = <b>${fmtMin(pl.typ.total)}</b>${rg ? ` (best–worst ${rg})` : ''}.</div>`;
+  h += '<table class="kv">' + KV('Throughput per database', mixTxt(pl.mix)) + KV('Typical', `<b>${fmtMin(pl.typ.total)}</b>`) + KV('Best case', `${fmtMin(pl.best.total)} — every server at the top of its range`) + KV('Worst case', `${fmtMin(pl.worst.total)} — every server at the bottom of its range`)
+    + (pl.k > 1 ? KV('Parallel streams', `${pl.k} — restores on the same server share it: together they never exceed the top of that server's throughput range (${[...pl.cap].slice(0, 4).map(([s, c]) => `${esc(s)} ${r0(c)} MB/s`).join(', ')}${pl.cap.size > 4 ? ', …' : ''}). Restores on different servers run independently.`) : '') + (pl.excluded ? KV('Excluded', `${pl.excluded} likely copies / archives`) : '') + '</table>';
+  h += `<p class="small" style="margin-top:10px">Click any restore time for its rationale. Not included: detection and decision time, log replay, application checks.</p>`;
+  return { title: label, sub: `${plural(pl.n, 'database')} · ${fmtMB(pl.vol)}`, html: h, cls: 'meas' };
+}
+function explainSrv(s) {
+  const P = prof(s), a = P.auto, sp = spec(s), ld = srvLoad(s), m = MAN[s] != null, rg = fmtRng(ld.best, ld.worst), kr = kRat();
+  let h = `<div class="why">${m ? `Using <b>${fmtRate(P.plan)}</b> (picked by you). Recommended: ${fmtRate(a.plan)}. ` : `Recommended <b>${fmtRate(a.plan)}</b>${a.lo !== a.hi ? ` (range ${r0(a.lo)}–${r0(a.hi)} MB/s)` : ''}. `}${why(P, s)}`
+    + (ld.n ? `<br>At ${fmtRate(P.plan)}, the ${plural(ld.n, 'database')} restored on ${esc(s)} (${fmtMB(ld.vol)}) ${ld.n === 1 ? 'takes' : 'take'} <b>${fmtMin(ld.t)}</b> one after another${rg ? ` (range ${rg})` : ''}.` : '') + '</div>';
+  h += '<table class="kv">' + KV('Server', `${esc(s)} ${envPill(sp.env)} ${catPill(s)} ${pfPill(s)}`)
+    + KV('Compute', `${specTxt(s)}${sp.ver ? ' · ' + esc(sqlv(sp.ver)) : ''}${sp.ed ? ' · ' + esc(sp.ed) : ''}${sp.loc ? ' · ' + esc(sp.loc) : ''}`)
+    + KV('Timed restores (actual)', P.own ? `min ${fmtRate(P.own.min)} · median ${fmtRate(P.own.med)} · max ${fmtRate(P.own.max)} <span class="small">(${plural(P.own.n, 'restore')})</span>` : '<span class="none">none timed on this server</span>')
+    + KV('Backups (actual)', P.bk ? `min ${fmtRate(P.bk.min)} · median ${fmtRate(P.bk.med)} · max ${fmtRate(P.bk.max)} <span class="small">(${plural(P.bk.n, 'backup')}, ${plural(P.bk.dbs, 'database')})</span>` : '<span class="none">none collected</span>')
+    + KV('Restore ÷ backup speed', `${kr.k.toFixed(2)} <span class="small">${kr.src === 'measured' ? `measured: median over ${plural(CAL.pairs.length, CAL.method === 'server' ? 'server' : 'restore')} with both timed restores and backups` : 'assumed — no timed restores to measure it yet; adjustable with “Restores run at … of backup speed” above the throughput table. Restores write the data and also zero-initialize the log, so they usually run below backup speed.'}</span>`)
+    + KV('Recommended', `${badge(a.basis)} <b>${fmtRate(a.plan)}</b>${a.lo !== a.hi ? ` <span class="small">range ${r0(a.lo)}–${r0(a.hi)} MB/s${a.thin ? ' — widened: fewer than 3 samples' : ''}</span>` : ''}`)
+    + KV('Confidence', confPill(a.conf)) + (ld.n ? KV('Restore all its databases', `<b>${fmtMin(ld.t)}</b> <span class="small">${plural(ld.n, 'DB')} · ${fmtMB(ld.vol)} · one after another</span>`) : '') + '</table>';
+  h += `<h3>Pick a value for ${esc(s)}</h3><div class="pick">${P.own ? chip(s, P.own.min, 'restore min') + chip(s, P.own.med, 'restore median') + chip(s, P.own.max, 'restore max') : ''}${P.bk ? chip(s, P.bk.min, 'backup min') + chip(s, P.bk.med, 'backup median') + chip(s, P.bk.max, 'backup max') : ''}${a.lo !== a.hi ? chip(s, a.lo, 'low') : ''}${chip(s, a.plan, 'recommended')}${a.lo !== a.hi ? chip(s, a.hi, 'high') : ''}</div>`;
+  h += '<h3>Sources considered, in order</h3>' + sourcesTable(P);
+  if (P.peer && (a.basis === 'peer' || !P.own)) h += peerTable(P.peer, s);
+  h += warnings({ P, basis: a.basis }, sp);
+  const sm = P.sm.slice().sort((x, y) => String(y.start).localeCompare(String(x.start)));
+  if (sm.length) h += `<details style="margin-top:10px"><summary class="small">Timed restores on ${esc(s)} (${sm.length})</summary>${sampleTable(sm.slice(0, 30))}</details>`;
+  return { title: `${s} — ${fmtRate(P.plan)}`, sub: sp.pl || '', html: h, cls: KIND(P.basis) };
+}
+function sampleTable(L, withSrv) {
+  return `<div class="scroll"><table><thead><tr>${withSrv ? '<th>Server</th>' : ''}<th>Started</th><th>Database</th><th class="num">Volume</th><th class="num">Duration</th><th class="num">MB/s</th><th>Restored from</th><th>Media</th>${withSrv ? '<th>Used</th>' : ''}</tr></thead><tbody>${L.map(e => `<tr>${withSrv ? `<td>${esc(e.s)}</td>` : ''}<td>${esc(String(e.start).slice(0, 16))}</td><td>${esc(e.db)}</td><td class="num">${fmtMB(e.mb)}</td><td class="num">${fmtDur(e.sec)}</td><td class="num"><b>${r0(e.rate)}</b></td><td class="small">${esc([e.from, e.fromDb].filter(Boolean).join(' / ') || '—')}</td><td class="small">${esc([e.dev, e.files > 1 ? e.files + ' files' : ''].filter(Boolean).join(' · ') || '—')}</td>${withSrv ? `<td>${qualifies(e) ? '<span class="pill ok">✓</span>' : `<span class="pill oth" title="Below ${S.minGB} GB or 10 s">small</span>`}</td>` : ''}</tr>`).join('')}</tbody></table></div>`;
+}
+
+/* ============================================================ DR topology tab (nodes, distribution, resources) */
+const regs = ns => [...new Set(ns.map(n => spec(n).loc).filter(Boolean))].join(' / ') || 'region n/a';
+function nodeBox(n) {
+  const x = spec(n), sqlvm = x.pc === 'IaaS' ? 'SQL Server on Azure VM' : x.pc === 'PaaS' ? 'Azure SQL Managed Instance' : x.pc === 'OnPrem' ? 'SQL Server on-prem' : 'SQL Server';
+  return `<div class="node"><b>${esc(n)}</b><div class="small" style="color:var(--ink2)">${sqlvm}</div><div style="margin-top:4px"><b>${x.cpu || '—'} vCPU</b> · <b>${x.mem ? x.mem + ' GB' : '—'}</b></div><div class="small">${esc(x.vm || 'VM size n/a')}</div><div class="small">${esc([sqlv(x.ver), x.ed].filter(Boolean).join(' · ') || 'SQL version n/a')}</div></div>`;
+}
+function renderTopo() {
+  XP.topo = [];
+  if (!AGS.length) { $('#topomain').innerHTML = '<div class="card"><span class="none">No Availability Groups in this inventory.</span></div>'; return; }
+  const noEd = AGS.flatMap(a => a.nodes.concat(a.dr)).some(n => !spec(n).ed);
+  let h = `<div class="card"><h2>Always On Availability Groups — DR topology</h2>${noEd ? '<p class="small" style="margin:0">SQL edition appears once the inventory has an Edition column or the restore-history collector has been run.</p>' : ''}</div>`;
+  AGS.forEach(a => {
+    h += `<div class="lane ag"><div class="lane-h"><span class="t">AG ${esc(a.ag)}</span><span class="pill">${a.nodes.length} PROD + ${a.dr.length} DR</span>${a.dr.length ? '' : '<span class="pill off">No DR replica in inventory</span>'}<span class="small">${a.app.map(esc).join(', ')}</span></div>
+     <div class="lane-b"><div class="region"><h4>PROD · ${esc(regs(a.nodes))}</h4><div class="nodes">${a.nodes.map(nodeBox).join('')}</div></div>
+      <div class="flow"><svg width="86" height="16" viewBox="0 0 86 16" aria-hidden="true"><line x1="2" y1="8" x2="76" y2="8" stroke="#8a96a5" stroke-width="2"/><path d="M74 3 L84 8 L74 13 Z" fill="#8a96a5"/></svg><span>AG replication</span></div>
+      <div class="region dr"><h4>DR · ${esc(a.dr.length ? regs(a.dr) : 'none')}</h4><div class="nodes">${a.dr.map(nodeBox).join('') || '<span class="none">No DR replica</span>'}</div></div></div></div>`;
+  });
+  $('#topomain').innerHTML = h;
+}
+
+/* ============================================================ restore history tab: files */
+function parseCSV(t) {
+  const first = t.slice(0, t.indexOf('\n') + 1 || t.length), dl = (first.match(/;/g) || []).length > (first.match(/,/g) || []).length ? ';' : (first.match(/\t/g) || []).length > (first.match(/,/g) || []).length ? '\t' : ',';
+  const rows = []; let r = [], c = '', q = 0;
+  for (let i = 0; i < t.length; i++) {
+    const ch = t[i];
+    if (q) { if (ch === '"') { if (t[i + 1] === '"') { c += '"'; i++; } else q = 0; } else c += ch; }
+    else if (ch === '"') q = 1; else if (ch === dl) { r.push(c); c = ''; }
+    else if (ch === '\n' || ch === '\r') { if (ch === '\r' && t[i + 1] === '\n') i++; r.push(c); rows.push(r); r = []; c = ''; }
+    else c += ch;
+  }
+  if (c || r.length) { r.push(c); rows.push(r); }
+  return rows;
+}
+async function unzip(buf) {
+  const dv = new DataView(buf); let e = buf.byteLength - 22;
+  while (e >= 0 && dv.getUint32(e, true) !== 0x06054b50) e--;
+  if (e < 0) throw new Error('not a valid .xlsx file');
+  const n = dv.getUint16(e + 10, true); let p = dv.getUint32(e + 16, true); const files = {}, td = new TextDecoder();
+  for (let i = 0; i < n; i++) {
+    const meth = dv.getUint16(p + 10, true), csz = dv.getUint32(p + 20, true), nl = dv.getUint16(p + 28, true), el = dv.getUint16(p + 30, true), cl = dv.getUint16(p + 32, true), off = dv.getUint32(p + 42, true);
+    files[td.decode(new Uint8Array(buf, p + 46, nl))] = { meth, csz, off }; p += 46 + nl + el + cl;
+  }
+  const get = async name => {
+    const f = files[name]; if (!f) return null;
+    const lnl = dv.getUint16(f.off + 26, true), lel = dv.getUint16(f.off + 28, true), data = new Uint8Array(buf, f.off + 30 + lnl + lel, f.csz);
+    if (f.meth === 0) return td.decode(data);
+    const st = new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw')); return await new Response(st).text();
+  };
+  return { get, names: Object.keys(files) };
+}
+const colIdx = ref => { const m = ref.match(/^[A-Z]+/i)[0].toUpperCase(); let n = 0; for (const ch of m) n = n * 26 + ch.charCodeAt(0) - 64; return n - 1; };
+async function readXlsx(buf) {
+  const z = await unzip(buf), q = (el, n) => el.getElementsByTagNameNS('*', n), P = x => new DOMParser().parseFromString(x, 'application/xml');
+  const ss = [], sx = await z.get('xl/sharedStrings.xml');
+  if (sx) for (const si of q(P(sx), 'si')) ss.push([...q(si, 't')].map(x => x.textContent).join(''));
+  let sheet = null; const wb = await z.get('xl/workbook.xml'), rel = await z.get('xl/_rels/workbook.xml.rels');
+  if (wb && rel) {
+    const sheets = [...q(P(wb), 'sheet')], pick = sheets.find(s => /restore/i.test(s.getAttribute('name') || '')) || sheets[0];
+    const rid = pick && (pick.getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships', 'id') || pick.getAttribute('r:id'));
+    for (const r of q(P(rel), 'Relationship')) if (r.getAttribute('Id') === rid) { const tg = r.getAttribute('Target'); sheet = tg.startsWith('/') ? tg.slice(1) : 'xl/' + tg.replace(/^\.\//, ''); }
+  }
+  if (!sheet || !z.names.includes(sheet)) sheet = z.names.filter(n => /^xl\/worksheets\/sheet\d+\.xml$/.test(n)).sort((a, b) => parseInt(a.match(/\d+/)[0]) - parseInt(b.match(/\d+/)[0]))[0];
+  if (!sheet) throw new Error('no worksheet found');
+  const rows = [];
+  for (const r of q(P(await z.get(sheet)), 'row')) {
+    const a = []; let ci = 0;
+    for (const c of q(r, 'c')) {
+      const ref = c.getAttribute('r'); if (ref) ci = colIdx(ref);
+      const ty = c.getAttribute('t'), v = q(c, 'v')[0];
+      a[ci] = ty === 's' ? (v ? (ss[+v.textContent] ?? '') : '') : ty === 'inlineStr' ? [...q(c, 't')].map(x => x.textContent).join('') : v ? v.textContent : '';
+      ci++;
+    }
+    rows.push(Array.from(a, x => x ?? ''));
+  }
+  return rows;
+}
+async function loadFile(f) {
+  if (!f) return;
+  try {
+    let rows = /\.csv$/i.test(f.name) ? parseCSV((await f.text()).replace(/^\uFEFF/, '')) : await readXlsx(await f.arrayBuffer());
+    rows = rows.filter(r => r.some(x => String(x).trim()));
+    if (!rows.length) throw new Error('file is empty');
+    const hdr = rows.shift().map(canon);
+    if (!hdr.includes('ServerName') || !hdr.includes('DatabaseName')) throw new Error('row 1 must contain ServerName and DatabaseName columns. Found: ' + hdr.join(', '));
+    const objs = rows.map(r => { const o = {}; hdr.forEach((k, i) => { if (k) o[k] = String(r[i] ?? '').trim(); }); return o; });
+    for (const k in MAN) delete MAN[k];
+    ingest(objs, f.name, hdr); $('#agp').dataset.ag = ''; renderAll();
+  } catch (err) { alert('Could not read ' + f.name + ': ' + err.message); }
+}
+function matchReport() {
+  XP.col = [];
+  if (!H) { $('#match').innerHTML = ''; return; }
+  const idx = {}; D.prod.forEach(x => { x.srvs.forEach(s => idx[s + '|' + x.db.toLowerCase()] = 'PROD'); x.drs.forEach(s => idx[s + '|' + x.db.toLowerCase()] = 'DR'); });
+  let p = 0, d = 0; const un = [];
+  Object.entries(H.db).forEach(([k, o]) => { const m = idx[k]; if (m === 'PROD') p++; else if (m === 'DR') d++; else un.push(o); });
+  const srvs = [...new Set(Object.keys(H.bySrv).concat(Object.keys(H.ev)))], unknown = srvs.filter(s => !D.servers[s]);
+  const evAll = Object.values(H.ev).flat(), evOk = evAll.filter(qualifies).length;
+  const missing = [...new Set([...PRODSET, ...DRSET])].filter(s => !H.bySrv[s] && spec(s).pc !== 'PaaS').sort();
+  $('#match').innerHTML = `<div class="kpis">${kpi('Rows loaded', H.rows.toLocaleString('en-US'), `${H.dbRows.toLocaleString('en-US')} database · ${H.evRows.toLocaleString('en-US')} restore${H.dup ? ` · ${H.dup} duplicates skipped` : ''}`)}${kpi('Servers in file', srvs.length, unknown.length ? `${unknown.length} not in inventory (used for estimates)` : 'all in inventory')}${kpi('Matched to PROD DBs', p, '', 'pr')}${kpi('Matched to DR DBs', d, '', 'dr')}${kpi('Timed restores', evAll.length.toLocaleString('en-US'), `${evOk} ≥ ${S.minGB} GB used for throughput${H.legacy ? ' · older format' : ''}`, 'hl')}${kpi('PROD / DR servers not collected', missing.length, missing.length ? 'estimated' : 'full coverage', missing.length ? 'dr' : '')}</div>` +
+    (missing.length ? `<details style="margin-top:10px"><summary class="small">PROD / DR servers without restore-history rows (${missing.length})</summary><p class="small">${missing.map(esc).join(', ')}</p></details>` : '') +
+    (evAll.length ? `<details id="evd" style="margin-top:8px"><summary class="small">Timed restore samples (${evAll.length.toLocaleString('en-US')} · ${evOk.toLocaleString('en-US')} used for throughput, the rest below ${S.minGB} GB or 10 s)</summary>${sampleTable(evAll.slice().sort((x, y) => String(y.start).localeCompare(String(x.start))).slice(0, 1000), true)}${evAll.length > 1000 ? '<p class="small">Showing the latest 1,000.</p>' : ''}</details>` : '') +
+    (un.length ? `<details style="margin-top:8px"><summary class="small">Database rows not in the PROD / DR inventory (${un.length})</summary><div class="scroll"><table><thead><tr><th>Server</th><th>Database</th><th>Latest restore</th></tr></thead><tbody>${un.slice(0, 500).map(o => `<tr><td>${esc(o.ServerName)}</td><td>${esc(o.DatabaseName)}</td><td>${esc(o.LastRestoreDate)}</td></tr>`).join('')}</tbody></table></div></details>` : '');
+}
+function serverList() {
+  const all = Object.keys(D.servers).filter(s => spec(s).pc !== 'PaaS').sort((a, b) => a.localeCompare(b)), g = { PROD: [], DR: [], other: [] };
+  all.forEach(s => { const e = D.servers[s].env; (e === 'PROD' ? g.PROD : e === 'DR' ? g.DR : g.other).push(s); });
+  const q = s => "  '" + s.replace(/'/g, "''") + "'";
+  let t = '';
+  if (g.PROD.length) t += `  # ---- PROD (${g.PROD.length})\n${g.PROD.map(q).join('\n')}\n`;
+  if (g.DR.length) t += `  # ---- DR (${g.DR.length})\n${g.DR.map(q).join('\n')}\n`;
+  if (g.other.length) t += `  # ---- Other environments (${g.other.length}) - optional: their restores add samples for estimates\n${g.other.map(q).join('\n')}\n`;
+  return t.replace(/\n$/, '') || "  # no servers found in the inventory";
+}
+const COLREF = [['RowType', "'Database' (one per user database) or 'Restore' (one per timed full restore)"], ['ServerName / CollectedFrom', 'SERVERPROPERTY(ServerName) / the name the runner connected with — both used for matching'], ['RestoreStartTime → RestoreCompletedTime', 'msdb restore start → “Database was restored” in the error log'], ['RestoreBackupMB / RestoreCompressedMB', 'uncompressed / on-media size of the restored backup'], ['RestoreMBps', 'RestoreBackupMB ÷ RestoreDurationSec'], ['RestoreDevice / RestoreFiles', 'Disk, URL, Virtual device, Tape / number of striped backup files'], ['SourceBackupMBps', 'speed at which the restored backup was originally taken'], ['LastFullBackup*', 'latest full backup taken on this server'], ['BackupSamples, BackupMBpsMin / Median / Max', 'full backups in the last 30 days, ≥ 1 GB, VSS snapshots excluded'], ['DataMB / LogMB', 'allocated data and log size'], ['HostCPU, HostMemoryGB, InstantFileInit, VmType, EngineEdition', 'instance facts — used when the inventory has no specs; EngineEdition 8 = Azure SQL MI']];
+
+/* ============================================================ wiring */
+function fillSelects() {
+  const agOf = new Map(); AGS.forEach(a => a.nodes.forEach(n => { if (!agOf.has(n)) agOf.set(n, a.ag); }));
+  const prodS = [...PRODSET].sort((a, b) => a.localeCompare(b)), drS = [...DRSET].filter(s => !PRODSET.has(s)).sort((a, b) => a.localeCompare(b)), stand = prodS.filter(s => !agOf.has(s));
+  const opt = (s, tag) => `<option value="${esc(s)}" class="${catOf(s)}">${esc(s)}  —  ${esc(tag)}${spec(s).pl ? ' · ' + esc(spec(s).pl) : ''}</option>`;
+  const sDR = stand.filter(s => catOf(s) === 'dr'), sNo = stand.filter(s => catOf(s) !== 'dr');
+  let h = '';
+  AGS.forEach(a => { h += `<optgroup label="PROD — AG ${esc(a.ag)} (${a.nodes.length} PROD + ${a.dr.length} DR)">${a.nodes.filter(n => agOf.get(n) === a.ag).map(s => opt(s, 'AG ' + a.ag)).join('')}</optgroup>`; });
+  if (sDR.length) h += `<optgroup label="PROD — Standalone with DR copy (${sDR.length})">${sDR.map(s => opt(s, 'Standalone · DR copy')).join('')}</optgroup>`;
+  if (sNo.length) h += `<optgroup label="PROD — Standalone without DR copy (${sNo.length})">${sNo.map(s => opt(s, 'Standalone · no DR')).join('')}</optgroup>`;
+  if (drS.length) h += `<optgroup label="DR servers (${drS.length})">${drS.map(s => opt(s, 'DR')).join('')}</optgroup>`;
+  const sv = $('#srvsel').value; $('#srvsel').innerHTML = h; if (sv) $('#srvsel').value = sv;
+  const gv = $('#agsel').value; $('#agsel').innerHTML = AGS.map(a => `<option value="${esc(a.ag)}" class="ag">AG ${esc(a.ag)}  —  ${a.nodes.length} PROD + ${a.dr.length} DR · ${plural(a.n, 'DB')} · ${esc(a.app.slice(0, 2).join(', '))}${a.app.length > 2 ? ' …' : ''}</option>`).join(''); if (gv) $('#agsel').value = gv;
+  const av = $('#app').value; $('#app').innerHTML = APPS.map(a => `<option>${esc(a)}</option>`).join(''); if (av) $('#app').value = av;
+}
+function headerStatus() {
+  const hs = $('#hs');
+  if (!H) { hs.textContent = 'Restore history not loaded — restore times use a 200 MB/s placeholder'; hs.className = 'hpill'; return; }
+  const ev = Object.values(H.ev).flat().filter(qualifies).length, sv = Object.keys(H.bySrv).length, bk = Object.values(PROF0).filter(p => p.bk).length;
+  hs.textContent = `Restore history: ${plural(sv, 'server')} · ${plural(ev, 'timed restore')} · ${plural(bk, 'server')} with backup speeds`; hs.className = 'hpill ok';
+  hs.title = H.name;
+}
+const TABS = ['imp', 'topo', 'col'];
+function showTab(k) {
+  if (!TABS.includes(k)) k = 'imp';
+  $$('nav button').forEach(b => { b.classList.toggle('on', b.dataset.k === k); b.setAttribute('aria-selected', b.dataset.k === k); });
+  $$('section').forEach(s => s.classList.toggle('on', s.id === 's-' + k));
+  if (k === 'imp') renderImpact(true); else if (k === 'topo') renderTopo(); else matchReport();
+  if (location.hash.slice(1) !== k) history.replaceState(null, '', '#' + k);
+}
+function renderAll() { fillSelects(); headerStatus(); const k = (location.hash || '#imp').slice(1); renderImpact(true); renderTopo(); matchReport(); showTab(k); }
+const TMR = new Map();
+const later = fn => { clearTimeout(TMR.get(fn)); TMR.set(fn, setTimeout(fn, 16)); };
+const rImp = () => renderImpact(false);
+function copyText(txt) {
+  const ta = document.createElement('textarea'); ta.value = txt; ta.setAttribute('readonly', ''); ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+  document.body.appendChild(ta); ta.select(); let ok = false;
+  try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+  ta.remove();
+  return ok ? Promise.resolve() : navigator.clipboard ? navigator.clipboard.writeText(txt) : Promise.reject(new Error('clipboard unavailable'));
+}
+function refreshTab() { const k = (location.hash || '#imp').slice(1); if (k === 'topo') renderTopo(); else if (k === 'col') matchReport(); else renderImpact(true); }
+document.addEventListener('click', e => {
+  const t = e.target;
+  const pk = t.closest('.pk[data-v]');
+  if (pk) { const s = pk.dataset.s, inModal = !!pk.closest('#mdl'); MAN[s] = +pk.dataset.v; PROF[s] = choose(s); refreshTab(); if (inModal) openModal(explainSrv(s)); return; }
+  const av = t.closest('[data-agview]');
+  if (av) { $('#mode').value = 'ag'; $('#agsel').value = av.dataset.agview; S.side = 'P'; showTab('imp'); scrollTo(0, 0); return; }
+  const tg = t.closest('[data-tgt]');
+  if (tg) { $(tg.dataset.role === 'DR' ? '#agd' : '#agp').value = tg.dataset.tgt; renderImpact(true); return; }
+  const rb = t.closest('.rt'); if (rb) { explainDb(ROWS[+rb.dataset.i]); return; }
+  const inf = t.closest('.info');
+  if (inf) { e.preventDefault(); if (inf.dataset.x) { const [tab, i] = inf.dataset.x.split(':'), f = XP[tab] && XP[tab][+i]; if (f) openModal(f()); } return; }
+  if (t.id === 'mdl' || t.closest('#mx')) { closeModal(); return; }
+  const cp = t.closest('[data-cp]');
+  if (cp) { const show = m => { cp.textContent = m; setTimeout(() => cp.textContent = cp.dataset.lbl, 1800); };
+    copyText($('#' + cp.dataset.cp).textContent).then(() => show('Copied ✓'), () => show('Copy failed — use Download')); return; }
+  const dl = t.closest('[data-dl]');
+  if (dl) { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([$('#' + dl.dataset.dl).textContent.replace(/\r?\n/g, '\r\n')], { type: 'text/plain' })); a.download = dl.dataset.fn; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 2000); }
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#mdl').hidden) closeModal(); });
+$('#nav').onclick = e => { const b = e.target.closest('button[data-k]'); if (b) showTab(b.dataset.k); };
+window.addEventListener('hashchange', () => showTab(location.hash.slice(1)));
+$('#mode').onchange = () => { S.side = 'P'; renderImpact(true); };
+$('#srvsel').onchange = () => { const s = $('#srvsel').value; S.side = DRSET.has(s) && !PRODSET.has(s) ? 'R' : 'P'; renderImpact(true); };
+$('#app').onchange = () => { S.side = 'P'; renderImpact(true); };
+$('#agsel').onchange = () => { S.side = 'P'; renderImpact(true); };
+$('#agp').onchange = () => renderImpact(true);
+$('#agd').onchange = () => renderImpact(true);
+$('#sidesel').onclick = e => { const b = e.target.closest('button[data-side]'); if (!b || b.disabled) return; S.side = b.dataset.side; renderImpact(false); };
+[['ovh', ' min'], ['streams', '']].forEach(([k, u]) => {
+  const i = $('#i_' + k); i.value = S[k]; $('#o_' + k).textContent = S[k] + u;
+  i.oninput = () => { S[k] = +i.value; $('#o_' + k).textContent = i.value + u; later(rImp); };
+});
+const rK = () => { recompute(); renderImpact(true); headerStatus(); };
+$('#i_k').oninput = e => { S.k = +e.target.value / 100; $('#o_k').textContent = e.target.value + '%'; later(rK); };
+$('#catlg').innerHTML = CATLG;
+$('#i_basis').value = S.basis; $('#i_basis').onchange = e => { S.basis = e.target.value; renderImpact(false); };
+$('#i_order').value = S.order; $('#i_order').onchange = e => { S.order = e.target.value; renderImpact(false); };
+$('#i_excl').checked = S.excl; $('#i_excl').onchange = e => { S.excl = e.target.checked; renderImpact(false); };
+$('#thr').addEventListener('input', e => {
+  const r = e.target.closest('input[data-sl]'); if (!r) return;
+  const s = r.dataset.sl, v = fromPos(+r.value); MAN[s] = v; PROF[s] = choose(s);
+  r.nextElementSibling.textContent = fmtRate(v);
+  $$('#thr [data-rs]').forEach(b => { if (b.dataset.rs === s) b.hidden = false; });
+  $$('#thr input[data-sl]').forEach(o => { if (o !== r && o.dataset.sl === s) { o.value = r.value; o.nextElementSibling.textContent = fmtRate(v); } });
+  later(rImp);
+});
+$('#thr').addEventListener('click', e => { const b = e.target.closest('[data-rs]'); if (!b) return; delete MAN[b.dataset.rs]; PROF[b.dataset.rs] = choose(b.dataset.rs); renderImpact(true); });
+$('#hfile').onchange = e => { loadFile(e.target.files[0]); e.target.value = ''; };
+$('#csv').onchange = e => { loadFile(e.target.files[0]); e.target.value = ''; };
+$('#tl').addEventListener('mousemove', e => {
+  const tip = $('#tip'), g = e.target.closest('.tb');
+  if (!g || !TLP) { tip.style.display = 'none'; return; }
+  const q = TLP.typ.seq[+g.dataset.q]; if (!q) return; const it = q.it;
+  tip.innerHTML = `<b>${esc(it.x.db)}</b><div class="small">${esc(it.x.app)} · ${esc(it.s)}</div><div>${fmtMB(it.v.V)} at ${fmtRate(it.rate)} ${badge(it.basis)}</div><div>${fmtT(q.start)} → ${fmtMin(q.end)}</div>`;
+  tip.style.display = 'block';
+  const r = tip.getBoundingClientRect(); let x = e.clientX + 14, y = e.clientY + 14;
+  if (x + r.width > innerWidth - 8) x = e.clientX - r.width - 14; if (y + r.height > innerHeight - 8) y = e.clientY - r.height - 14;
+  tip.style.left = x + 'px'; tip.style.top = y + 'px';
+});
+$('#tl').addEventListener('mouseleave', () => { $('#tip').style.display = 'none'; });
+let rsz = 0; window.addEventListener('resize', () => { clearTimeout(rsz); rsz = setTimeout(() => { if ($('#s-imp').classList.contains('on') && TLP) drawTimeline(TLP); }, 150); });
+$('#sqlall').textContent = $('#src-sql').textContent.trim() + '\n';
+$('#psall').textContent = $('#src-ps').textContent.trim().replace('__SERVERLIST__', () => serverList()) + '\n';
+$('#colref').innerHTML = `<table class="kv">${COLREF.map(([a, b]) => KV(esc(a), esc(b))).join('')}</table>`;
+if (HIST0 && HIST0.rows && HIST0.cols) {
+  const cols = HIST0.cols.map(canon);
+  ingest(HIST0.rows.map(r => { const o = {}; cols.forEach((c, i) => o[c] = r[i] == null ? '' : String(r[i])); return o; }), HIST0.name + ' (embedded)', cols);
+} else recompute();
+renderAll();
+</script></body></html>
+'@
+
+# ---------------------------------------------------------------- helpers
+function Normalize-Header([string]$h) { return (($h -replace '[^A-Za-z0-9]', '').ToLowerInvariant()) }
+
+function To-Cell($v) {
+    if ($null -eq $v -or $v -is [DBNull]) { return '' }
+    if ($v -is [datetime]) { return $v.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture) }
+    if ($v -is [double] -or $v -is [single] -or $v -is [decimal]) { return ([double]$v).ToString('R', [Globalization.CultureInfo]::InvariantCulture) }
+    $s = ([string]$v).Trim()
+    if ($s -eq 'NULL') { return '' }   # SSMS "Results to grid" exports write NULL as text
+    return $s
+}
+function Get-Edition([string]$Text) {
+    if ($Text -match 'Enterprise') { return 'Enterprise' }
+    if ($Text -match 'Standard') { return 'Standard' }
+    if ($Text -match 'Developer') { return 'Developer' }
+    if ($Text -match 'Express') { return 'Express' }
+    if ($Text -match '\bWeb\b') { return 'Web' }
+    if ($Text -match 'Evaluation') { return 'Evaluation' }
+    return ''
+}
+
+function Read-Table {
+    # Returns @{ Headers = string[]; Rows = List[object[]] } from .csv or .xlsx/.xls (ImportExcel, else Excel COM)
+    param([string]$Path, [string]$Sheet, [string]$PreferSheet)
+    $full = (Resolve-Path -LiteralPath $Path).Path
+    Write-Host "Reading $full" -ForegroundColor Cyan
+    $rows = New-Object System.Collections.Generic.List[object]
+    $headers = @()
+    if ($full -match '\.csv$') {
+        $data = @(Import-Csv -LiteralPath $full -Encoding UTF8)
+        if ($data.Count -eq 0) { throw "No data in $full" }
+        $headers = @($data[0].PSObject.Properties | ForEach-Object { $_.Name })
+        foreach ($d in $data) { $rows.Add(@(foreach ($h in $headers) { $d.$h })) }
+    }
+    elseif (Get-Module -ListAvailable -Name ImportExcel) {
+        Import-Module ImportExcel
+        if (-not $Sheet -and $PreferSheet) {
+            $Sheet = @(Get-ExcelSheetInfo -Path $full | ForEach-Object { $_.Name } | Where-Object { $_ -match $PreferSheet }) | Select-Object -First 1
+        }
+        $p = @{ Path = $full; NoHeader = $true; DataOnly = $true }
+        if ($Sheet) { $p.WorksheetName = $Sheet }
+        $raw = @(Import-Excel @p)
+        if ($raw.Count -eq 0) { throw "No data in $full" }
+        $propNames = @($raw[0].PSObject.Properties.Name)
+        $headers = @(foreach ($pn in $propNames) { [string]$raw[0].$pn })
+        for ($r = 1; $r -lt $raw.Count; $r++) { $rows.Add(@(foreach ($pn in $propNames) { $raw[$r].$pn })) }
+    }
+    else {
+        Write-Host "  ImportExcel module not found - using Excel COM" -ForegroundColor DarkYellow
+        $xl = New-Object -ComObject Excel.Application
+        $xl.Visible = $false; $xl.DisplayAlerts = $false
+        try {
+            $wb = $xl.Workbooks.Open($full, 0, $true)
+            $ws = $null
+            if ($Sheet) { $ws = $wb.Worksheets.Item($Sheet) }
+            elseif ($PreferSheet) { foreach ($w in $wb.Worksheets) { if ($w.Name -match $PreferSheet) { $ws = $w; break } } }
+            if (-not $ws) { $ws = $wb.Worksheets.Item(1) }
+            $v = $ws.UsedRange.Value2
+            if ($v -is [array]) {
+                $nr = $v.GetLength(0); $nc = $v.GetLength(1)
+                $headers = @(for ($c = 1; $c -le $nc; $c++) { [string]$v[1, $c] })
+                for ($r = 2; $r -le $nr; $r++) {
+                    $vals = New-Object object[] $nc
+                    for ($c = 1; $c -le $nc; $c++) { $vals[$c - 1] = $v[$r, $c] }
+                    $rows.Add($vals)
+                }
+            } elseif ($null -ne $v) { $headers = @([string]$v) }
+            $wb.Close($false)
+        }
+        finally {
+            $xl.Quit()
+            [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($xl)
+            [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+        }
+    }
+    return [pscustomobject]@{ Headers = $headers; Rows = $rows }
+}
+
+function Read-Sheet {
+    param([string]$Path, [string]$Sheet, [string[]]$Required, [string[]]$Optional)
+    $t = Read-Table -Path $Path -Sheet $Sheet
+    $headers = $t.Headers
+    $idx = @{}
+    for ($i = 0; $i -lt $headers.Count; $i++) {
+        $k = Normalize-Header $headers[$i]
+        if ($k -and -not $idx.ContainsKey($k)) { $idx[$k] = $i }
+    }
+    $map = @{}
+    foreach ($c in $Required) {
+        $k = Normalize-Header $c
+        if (-not $idx.ContainsKey($k)) { throw "Column '$c' not found in $Path. Found: $($headers -join ', ')" }
+        $map[$c] = $idx[$k]
+    }
+    foreach ($c in $Optional) {
+        $k = Normalize-Header $c
+        if ($idx.ContainsKey($k)) { $map[$c] = $idx[$k] } else { Write-Host "  (optional column '$c' not found - left blank)" -ForegroundColor DarkGray }
+    }
+    $out = New-Object System.Collections.Generic.List[hashtable]
+    foreach ($row in $t.Rows) {
+        $h = @{}; $empty = $true
+        foreach ($c in ($Required + $Optional)) {
+            $s = if ($map.ContainsKey($c)) { To-Cell $row[$map[$c]] } else { '' }
+            if ($s) { $empty = $false }
+            $h[$c] = $s
+        }
+        if (-not $empty) { $out.Add($h) }
+    }
+    Write-Host ("  {0} rows, {1} columns (using {2})" -f $out.Count, $headers.Count, $map.Count)
+    return , $out
+}
+
+function Get-Short([string]$name) {
+    $n = "$name".Trim() -replace '^tcp:', ''
+    if (-not $n) { return '' }
+    $n = $n -replace ',\d+$', ''
+    $inst = ''
+    if ($n.Contains('\')) { $p = $n.Split('\', 2); $n = $p[0]; $inst = '\' + $p[1] }
+    $n = $n -replace '\.database\.windows\.net$', ''
+    return ($n.Split('.')[0] + $inst).ToUpperInvariant()
+}
+function To-Num($v) {
+    $d = 0.0
+    $s = ("$v" -replace '[,\s]', '')
+    if ([double]::TryParse($s, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$d)) { return $d }
+    return 0.0
+}
+function To-Int($v) { return [int][math]::Round((To-Num $v)) }
+function Norm-Env([string]$e) {
+    $u = "$e".Trim().ToUpperInvariant()
+    if ($u -match '^PROD|^PRD|PRODUCTION') { return 'PROD' }
+    if ($u -match '^DR|DISASTER') { return 'DR' }
+    return $u
+}
+function Norm-Ver([string]$v) {
+    if ($v -match '2008\s*R2') { return '2008R2' }
+    if ($v -match '(20\d\d)') { return $Matches[1] }
+    return $v
+}
+function Get-Platform([string]$Plat, [string]$Names, [string]$Vm) {
+    # Class: IaaS | PaaS | OnPrem | '' ; Label shown in the report
+    $p = "$Plat"
+    $azure = ($p -match 'azure') -or ($Vm -match '^Standard_') -or ($Names -match '\.database\.windows\.net')
+    if ($Names -match '\.database\.windows\.net' -or $p -match 'paas|managed\s*instance|sql\s*mi\b|\bmi\b|azure\s*sql\s*(db|database)') {
+        return @{ Class = 'PaaS'; Label = $(if ($azure -or $p -match '\bmi\b|managed') { 'PaaS · Azure SQL MI' } else { 'PaaS' }) }
+    }
+    if ($p -match 'iaas|azure|aws|ec2|gcp|google|cloud' -or $Vm -match '^Standard_') {
+        $lbl = if ($azure) { 'IaaS · Azure VM' } elseif ($p -match 'aws|ec2') { 'IaaS · AWS EC2' } elseif ($p -match 'gcp|google') { 'IaaS · GCP VM' } else { 'IaaS VM' }
+        return @{ Class = 'IaaS'; Label = $lbl }
+    }
+    if ($p -match 'on-?\s*prem|vmware|vsphere|esx|hyper-?v|physical|bare\s*metal|\bvm\b|virtual|data\s*cent') {
+        $lbl = if ($p -match 'physical|bare') { 'On-prem physical' } elseif ($p -match 'vmware|vsphere|esx|hyper-?v|\bvm\b|virtual') { 'On-prem VM' } else { 'On-prem' }
+        return @{ Class = 'OnPrem'; Label = $lbl }
+    }
+    return @{ Class = ''; Label = $p }
+}
+function Json-Str([string]$s) {
+    if ($null -eq $s) { $s = '' }
+    $s = $s.Replace('\', '\\').Replace('"', '\"')
+    $s = [regex]::Replace($s, '[\u0000-\u001f<>&]', { param($m) '\u{0:x4}' -f [int][char]$m.Value })
+    return '"' + $s + '"'
+}
+
+# ---------------------------------------------------------------- read files
+$dbRows = Read-Sheet -Path $DatabasesXlsx -Sheet $DatabasesSheet `
+    -Required @('ServerName', 'DatabaseName', 'DatabaseSizeMB', 'DatabaseStatus', 'Environment', 'ApplicationName', 'AGName', 'DatabaseClassification') `
+    -Optional @('SQLVersion', 'Platform', 'SQLEdition', 'Edition')
+$invRows = Read-Sheet -Path $InventoryXlsx -Sheet $InventorySheet `
+    -Required @('ServerName') `
+    -Optional @('LogicalCPUCount', 'PhysicalMemoryGB', 'Size', 'Location', 'Platform', 'Edition', 'SQLEdition')
+
+# ---------------------------------------------------------------- normalise
+$all = foreach ($r in $dbRows) {
+    if (-not $r.ServerName -or -not $r.DatabaseName) { continue }
+    $ag = $r.AGName; if (-not $ag -or $ag -match '^(NA|N/A|NULL|NONE|-)$') { $ag = 'NA' }
+    $short = Get-Short $r.ServerName
+    $apps = @(($r.ApplicationName -split '\s+/\s+') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if (-not $apps.Count) { $apps = @('(Unassigned)') }
+    [pscustomobject]@{
+        Short  = $short
+        Raw    = $r.ServerName
+        Db     = $r.DatabaseName
+        Mb     = To-Num $r.DatabaseSizeMB
+        Status = $r.DatabaseStatus.ToUpperInvariant()
+        Env    = Norm-Env $r.Environment
+        Ver    = Norm-Ver $r.SQLVersion
+        Ed     = Get-Edition ("{0} {1} {2}" -f $r.SQLEdition, $r.Edition, $r.SQLVersion)
+        Plat   = $r.Platform
+        App    = $apps[0]
+        Apps   = $apps
+        Ag     = $ag
+        Cls    = $r.DatabaseClassification.ToUpperInvariant()
+        Unit   = $(if ($ag -eq 'NA') { $short } else { $ag })
+    }
+}
+# one spelling per AG name (case-insensitive)
+$agCanon = @{}
+foreach ($x in $all) {
+    if ($x.Ag -eq 'NA') { continue }
+    if (-not $agCanon.ContainsKey($x.Ag)) { $agCanon[$x.Ag] = $x.Ag }
+    $x.Ag = $agCanon[$x.Ag]; $x.Unit = $x.Ag
+}
+$user   = @($all | Where-Object { $_.Cls -ne 'SNAPSHOT' })
+$online = @($user | Where-Object { $_.Status -eq 'ONLINE' })
+$offAll = @($user | Where-Object { $_.Status -ne 'ONLINE' -and ($_.Env -eq 'PROD' -or $_.Env -eq 'DR') })
+$prod   = @($online | Where-Object { $_.Env -eq 'PROD' })
+$dr     = @($online | Where-Object { $_.Env -eq 'DR' })
+Write-Host ("Rows: {0} total | {1} snapshots skipped | {2} online PROD | {3} online DR | {4} not-online PROD/DR" -f `
+    @($all).Count, (@($all).Count - $user.Count), $prod.Count, $dr.Count, $offAll.Count)
+
+# ---------------------------------------------------------------- PROD -> DR pairing
+$generic = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+'dbautility','dba','dba_2','dba_sql_hardening','reportserver','reportservertempdb','testdb','test','testing','dba_test','dbaadmin','ssisdb','distribution' | ForEach-Object { [void]$generic.Add($_) }
+
+$pairs = @{}
+# AG: every DR server that hosts databases of the same AG (an AG can have several DR replicas)
+foreach ($ag in @($prod | Where-Object { $_.Ag -ne 'NA' } | ForEach-Object { $_.Ag } | Sort-Object -Unique)) {
+    $d = @($dr | Where-Object { $_.Ag -eq $ag } | ForEach-Object { $_.Short } | Sort-Object -Unique)
+    if ($d.Count) { $pairs["AG|$ag"] = $d }
+}
+# Standalone: the DR server with the most non-generic database names in common, for the same applications
+$drStand = @($dr | Where-Object { $_.Ag -eq 'NA' } | Group-Object Short)
+foreach ($g in @($prod | Where-Object { $_.Ag -eq 'NA' } | Group-Object Short)) {
+    $appSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $names  = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($x in $g.Group) {
+        foreach ($a in $x.Apps) { [void]$appSet.Add($a) }
+        if (-not $generic.Contains($x.Db)) { [void]$names.Add($x.Db) }
+    }
+    $best = $null; $bestScore = 0
+    foreach ($h in $drStand) {
+        $hn = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($x in $h.Group) {
+            $hit = $false; foreach ($a in $x.Apps) { if ($appSet.Contains($a)) { $hit = $true; break } }
+            if ($hit) { [void]$hn.Add($x.Db) }
+        }
+        if ($hn.Count -eq 0) { continue }
+        $hn.IntersectWith($names)
+        if ($hn.Count -gt $bestScore) { $best = $h.Name; $bestScore = $hn.Count }
+    }
+    if ($best) { $pairs["SA|$($g.Name)"] = @($best) }
+}
+$drKey = @{}
+foreach ($d in $dr) { $drKey["$($d.Short)|$($d.Db)".ToLowerInvariant()] = $d }
+
+# ---------------------------------------------------------------- PROD rows (one per AG/instance + DB)
+$copyRx = [regex]::new('(_\d{6,8}$|_\d{4}-\d\d-\d\dT|PITR|_bak$|_old$|_Arch_\d|_\d{2}[a-z]{3}\d{2}$|_mock$|_Price_archive|^XFER_)', 'IgnoreCase')
+$groups = [ordered]@{}
+foreach ($p in $prod) {
+    $k = "$($p.Unit)|$($p.Db)"
+    if (-not $groups.Contains($k)) { $groups[$k] = New-Object System.Collections.Generic.List[object] }
+    $groups[$k].Add($p)
+}
+$prodOut = New-Object System.Collections.Generic.List[object]
+foreach ($k in @($groups.Keys)) {
+    $L = $groups[$k]; $f = $L[0]
+    $pk = if ($f.Ag -ne 'NA') { "AG|$($f.Ag)" } else { "SA|$($f.Short)" }
+    [string[]]$drs = @(@($pairs[$pk]) | Where-Object { $_ -and $drKey.ContainsKey("$_|$($f.Db)".ToLowerInvariant()) })
+    $m = if ($drs.Count) { $drKey["$($drs[0])|$($f.Db)".ToLowerInvariant()] } else { $null }
+    $mech = ''
+    if ($m) {
+        if ($f.Ag -ne 'NA') { $mech = 'Always On AG (DR replica)' }
+        elseif ($m.Short -like '*-FAILOVER') { $mech = 'Azure SQL MI failover group' }
+        else { $mech = 'Log shipping / backup-restore (inferred)' }
+    }
+    [string[]]$srvs = @($L | ForEach-Object { $_.Short } | Sort-Object -Unique)
+    $apps = New-Object System.Collections.Generic.List[string]
+    foreach ($x in $L) { foreach ($a in $x.Apps) { if (-not $apps.Contains($a)) { $apps.Add($a) } } }
+    $prodOut.Add([ordered]@{
+        app  = $apps[0]
+        apps = $apps.ToArray()
+        srv  = $srvs[0]
+        srvs = $srvs
+        db   = $f.Db
+        mb   = [double](($L | Measure-Object -Property Mb -Maximum).Maximum)
+        ag   = $f.Ag
+        unit = $f.Unit
+        dr   = $(if ($drs.Count) { $drs[0] } else { '' })
+        drs  = $drs
+        drmb = $(if ($m) { [double]$m.Mb } else { $null })
+        mech = $mech
+        copy = $copyRx.IsMatch($f.Db)
+    })
+}
+
+# ---------------------------------------------------------------- offline list
+$offOut = New-Object System.Collections.Generic.List[object]
+foreach ($o in $offAll) {
+    $offOut.Add([ordered]@{ app = $o.App; apps = [string[]]$o.Apps; srv = $o.Short; db = $o.Db; env = $o.Env; st = $o.Status; mb = [double]$o.Mb })
+}
+
+# ---------------------------------------------------------------- server specs + platform
+$inv = @{}
+foreach ($r in $invRows) {
+    $s = Get-Short $r.ServerName
+    if ($s -and -not $inv.ContainsKey($s)) { $inv[$s] = $r }
+}
+$serversOut = [ordered]@{}
+foreach ($g in @($user | Group-Object Short)) {
+    $s = $g.Name; $i = $inv[$s]
+    $plat = @($g.Group | ForEach-Object { $_.Plat } | Where-Object { $_ }) | Select-Object -First 1
+    if (-not $plat -and $i -and $i.Platform) { $plat = $i.Platform }
+    $names = (@($g.Group | ForEach-Object { $_.Raw }) + $(if ($i) { @($i.ServerName) } else { @() })) -join ' '
+    $vm = if ($i) { [string]$i.Size } else { '' }
+    $pf = Get-Platform $plat $names $vm
+    $envs = @($g.Group | ForEach-Object { $_.Env } | Sort-Object -Unique)
+    $env = if ($envs -contains 'PROD') { 'PROD' } elseif ($envs -contains 'DR') { 'DR' } else { [string]($envs | Select-Object -First 1) }
+    $ver = @($g.Group | ForEach-Object { $_.Ver } | Where-Object { $_ }) | Select-Object -First 1
+    $ed = if ($i) { Get-Edition ("{0} {1}" -f $i.Edition, $i.SQLEdition) } else { '' }
+    if (-not $ed) { $ed = @($g.Group | ForEach-Object { $_.Ed } | Where-Object { $_ }) | Select-Object -First 1 }
+    $serversOut[$s] = [ordered]@{
+        cpu  = $(if ($i) { To-Int $i.LogicalCPUCount } else { 0 })
+        mem  = $(if ($i) { To-Int $i.PhysicalMemoryGB } else { 0 })
+        vm   = $vm
+        loc  = $(if ($i) { [string]$i.Location } else { '' })
+        ver  = [string]$ver
+        ed   = [string]$ed
+        plat = [string]$plat
+        pc   = $pf.Class
+        pl   = $pf.Label
+        env  = $env
+    }
+}
+$noSpec = @($serversOut.Keys | Where-Object { -not $inv.ContainsKey($_) })
+if ($noSpec.Count) { Write-Host ("  {0} servers not found in inventory (specs blank): {1}" -f $noSpec.Count, ($noSpec -join ', ')) -ForegroundColor DarkYellow }
+
+# ---------------------------------------------------------------- optional restore history (embedded)
+$histJson = 'null'
+$histInfo = ''
+if ($RestoreHistory) {
+    $HistCols = @('RowType','ServerName','CollectedFrom','DatabaseName','SizeMB','DataMB','LogMB','State','RecoveryModel','LastRestoreDate',
+        'RestoredFromServer','RestoredFromDatabase','RestoredBy','RestoreBackupMB','RestoreCompressedMB','RestoreStartTime','RestoreCompletedTime',
+        'RestoreDurationSec','RestoreDuration','RestoreDurationSource','RestoreMBps','RestoreSeconds','RestoreDevice','RestoreFiles','SourceBackupSec',
+        'SourceBackupMBps','RestoreCount','MeasuredRestores','LastFullBackupDate','LastFullBackupMB','LastFullBackupCompressedMB','LastFullBackupSec',
+        'BackupMBps','BackupDevice','BackupFiles','BackupSamples','BackupMBpsMin','BackupMBpsMedian','BackupMBpsMax','HostCPU','HostMemoryGB',
+        'InstantFileInit','VmType','SqlVersion','EngineEdition','SqlEdition')
+    $t = Read-Table -Path $RestoreHistory -PreferSheet 'restore'
+    $canon = @{}; foreach ($c in $HistCols) { $canon[(Normalize-Header $c)] = $c }
+    $map = New-Object System.Collections.Generic.List[object]
+    $used = @{}
+    for ($i = 0; $i -lt $t.Headers.Count; $i++) {
+        $k = Normalize-Header $t.Headers[$i]
+        if ($canon.ContainsKey($k) -and -not $used.ContainsKey($k)) { $used[$k] = $true; $map.Add([pscustomobject]@{ I = $i; C = $canon[$k] }) }
+    }
+    if (-not ($used.ContainsKey('servername') -and $used.ContainsKey('databasename'))) {
+        throw "Restore history file needs ServerName and DatabaseName columns. Found: $($t.Headers -join ', ')"
+    }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('{"name":').Append((Json-Str (Split-Path $RestoreHistory -Leaf))).Append(',"cols":[')
+    [void]$sb.Append((@($map | ForEach-Object { Json-Str $_.C }) -join ',')).Append('],"rows":[')
+    $n = 0
+    foreach ($row in $t.Rows) {
+        $cells = @(foreach ($m in $map) { To-Cell $row[$m.I] })
+        if (-not ($cells -join '')) { continue }
+        if ($n) { [void]$sb.Append(',') }
+        [void]$sb.Append('[').Append((@($cells | ForEach-Object { Json-Str $_ }) -join ',')).Append(']')
+        $n++
+    }
+    [void]$sb.Append(']}')
+    $histJson = $sb.ToString()
+    $histInfo = "$n rows from $(Split-Path $RestoreHistory -Leaf)"
+    Write-Host "  restore history: $histInfo" -ForegroundColor Green
+}
+
+# ---------------------------------------------------------------- write HTML
+$data = [ordered]@{ prod = $prodOut.ToArray(); off = $offOut.ToArray(); servers = $serversOut }
+$json = (ConvertTo-Json -InputObject $data -Depth 6 -Compress).Replace('<', '<')
+$enc = { param($s) [System.Net.WebUtility]::HtmlEncode($s) }
+$src = (& $enc (Split-Path $DatabasesXlsx -Leaf)) + ' + ' + (& $enc (Split-Path $InventoryXlsx -Leaf))
+$tokens = @{ DATA = $json; HIST = $histJson; GENDATE = (Get-Date -Format 'yyyy-MM-dd HH:mm'); SRCFILES = $src }
+$html = [regex]::Replace($Template, '__(DATA|HIST|GENDATE|SRCFILES)__', { param($m) $tokens[$m.Groups[1].Value] })
+$outFull = [System.IO.Path]::GetFullPath($OutHtml)
+[System.IO.File]::WriteAllText($outFull, $html, (New-Object System.Text.UTF8Encoding($false)))
+
+$withDr = @($prodOut | Where-Object { $_.dr }).Count
+Write-Host ""
+Write-Host ("PROD databases : {0}" -f $prodOut.Count) -ForegroundColor Green
+Write-Host ("  with DR copy : {0}" -f $withDr) -ForegroundColor Green
+Write-Host ("  no DR copy   : {0}" -f ($prodOut.Count - $withDr)) -ForegroundColor Green
+Write-Host ("AGs            : {0}" -f @($prodOut | Where-Object { $_.ag -ne 'NA' } | ForEach-Object { $_.ag } | Select-Object -Unique).Count) -ForegroundColor Green
+Write-Host ("Not online     : {0}" -f $offOut.Count) -ForegroundColor Green
+if ($histInfo) { Write-Host ("History        : {0}" -f $histInfo) -ForegroundColor Green }
+Write-Host ("Output         : {0}" -f $outFull) -ForegroundColor Green
+if (-not $NoOpen) { Start-Process $outFull }
